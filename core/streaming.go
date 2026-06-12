@@ -73,6 +73,15 @@ type PreviewFinishPreference interface {
 	KeepPreviewOnFinish() bool
 }
 
+// PreviewSendNewAfterKeep is an optional interface that pairs with
+// PreviewFinishPreference to request a hybrid flow: the preview message is
+// kept (not deleted, not patched) and the engine emits a fresh, separate
+// final message. Useful when in-place edits to the preview do not surface
+// a push notification on the host platform (e.g. Feishu Message.Patch).
+type PreviewSendNewAfterKeep interface {
+	ShouldSendNewAfterKeepPreview() bool
+}
+
 func newStreamPreview(cfg StreamPreviewCfg, p Platform, replyCtx any, ctx context.Context, transform func(string) string) *streamPreview {
 	return &streamPreview{
 		cfg:       cfg,
@@ -307,6 +316,18 @@ func (sp *streamPreview) finish(finalText string) bool {
 	keepPreview := false
 	if pref, ok := sp.platform.(PreviewFinishPreference); ok {
 		keepPreview = pref.KeepPreviewOnFinish()
+	}
+	sendNewAfterKeep := false
+	if pref, ok := sp.platform.(PreviewSendNewAfterKeep); ok {
+		sendNewAfterKeep = pref.ShouldSendNewAfterKeepPreview()
+	}
+
+	// Hybrid mode: keep the preview message untouched and let the engine send
+	// a separate final message. Detach the handle so the engine takes over.
+	if keepPreview && sendNewAfterKeep {
+		slog.Debug("stream preview finish: keeping preview, detaching for fresh send")
+		sp.previewMsgID = nil
+		return false
 	}
 
 	// If platform wants to delete the preview and send fresh, let it.

@@ -118,6 +118,7 @@ type Platform struct {
 	appSecret                  string
 	progressStyle              string
 	useInteractiveCard         bool
+	finalizeAsNewMessage       bool
 	self                       core.Platform
 	reactionEmoji              string
 	doneEmoji                  string
@@ -220,6 +221,10 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	if v, ok := opts["enable_feishu_card"].(bool); ok {
 		useInteractiveCard = v
 	}
+	finalizeAsNewMessage := false
+	if v, ok := opts["finalize_as_new_message"].(bool); ok {
+		finalizeAsNewMessage = v
+	}
 
 	// Webhook mode configuration (for Lark international version)
 	port, _ := opts["port"].(string)
@@ -244,6 +249,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		appSecret:                  appSecret,
 		progressStyle:              progressStyle,
 		useInteractiveCard:         useInteractiveCard,
+		finalizeAsNewMessage:       finalizeAsNewMessage,
 		reactionEmoji:              reactionEmoji,
 		doneEmoji:                  doneEmoji,
 		allowFrom:                  allowFrom,
@@ -285,6 +291,16 @@ func (p *Platform) dispatchPlatform() core.Platform {
 
 func (p *Platform) KeepPreviewOnFinish() bool {
 	return p.useInteractiveCard
+}
+
+// ShouldSendNewAfterKeepPreview signals to the streaming engine that the
+// platform wants to keep the existing preview message AND emit a fresh
+// separate final message. Engine will detach the preview (cancel timers, clear
+// handle) and call Send for the final content. Used on Feishu to surface a
+// "real" final message that triggers a push notification, since in-place
+// Message.Patch updates do not.
+func (p *Platform) ShouldSendNewAfterKeepPreview() bool {
+	return p.useInteractiveCard && p.finalizeAsNewMessage
 }
 
 func (p *Platform) Start(handler core.MessageHandler) error {

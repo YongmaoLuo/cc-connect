@@ -195,6 +195,56 @@ func (m *mockKeepPreviewPlatform) KeepPreviewOnFinish() bool {
 	return true
 }
 
+// mockKeepAndSendNewPlatform adds PreviewSendNewAfterKeep to mockKeepPreviewPlatform.
+// It requests the hybrid flow: keep the preview message and let the engine
+// emit a separate final message.
+type mockKeepAndSendNewPlatform struct {
+	mockKeepPreviewPlatform
+}
+
+func (m *mockKeepAndSendNewPlatform) ShouldSendNewAfterKeepPreview() bool {
+	return true
+}
+
+func TestStreamPreview_FinishKeepsPreviewAndSignalsFreshSend(t *testing.T) {
+	mp := &mockKeepAndSendNewPlatform{}
+	cfg := StreamPreviewCfg{
+		Enabled:       true,
+		IntervalMs:    50,
+		MinDeltaChars: 1,
+		MaxChars:      500,
+	}
+
+	sp := newStreamPreview(cfg, mp, "ctx", context.Background(), nil)
+	sp.appendText("Hello World")
+	time.Sleep(100 * time.Millisecond)
+
+	ok := sp.finish("Hello World Final")
+	if ok {
+		t.Fatal("finish should return false so the engine emits a fresh final message")
+	}
+
+	mp.mu.Lock()
+	deletedCount := len(mp.deleted)
+	msgs := append([]string(nil), mp.messages...)
+	previewID := sp.previewMsgID
+	mp.mu.Unlock()
+
+	if deletedCount != 0 {
+		t.Fatalf("expected no delete call, got %d", deletedCount)
+	}
+	// Final text must NOT be patched into the preview; the preview is left
+	// untouched so the engine can send the full final response as a new message.
+	for _, m := range msgs {
+		if m == "update:Hello World Final" {
+			t.Fatalf("preview was patched with final text; messages = %#v", msgs)
+		}
+	}
+	if previewID != nil {
+		t.Fatalf("previewMsgID should be detached (nil) after finish, got %v", previewID)
+	}
+}
+
 func TestStreamPreview_FreezeDeletesOnFinish(t *testing.T) {
 	mp := &mockCleanerPlatform{}
 	cfg := StreamPreviewCfg{
