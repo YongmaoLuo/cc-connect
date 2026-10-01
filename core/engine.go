@@ -10687,21 +10687,27 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 	// and keep the session alive for the next user message rather than
 	// killing the process and destroying state.
 	//
-	// We hold e.interactiveMu across the CancelTurn call so that on failure
-	// (cancelErr != nil) we can fall through to normalCleanup below without
-	// a double-unlock. CancelTurn implementations must NOT acquire
-	// e.interactiveMu themselves — they operate on the agent subprocess's
-	// own state (stdin write, etc.) and don't touch engine bookkeeping.
+	// Release the engine lock BEFORE calling CancelTurn.
+	//
+	// claudecode's CancelTurn now waits for the CLI to confirm the interrupted
+	// turn actually terminated (up to its confirm timeout) — it is a blocking
+	// call, and holding e.interactiveMu across it would stall every other
+	// session's message routing for the duration.
+	//
+	// The old "hold the lock across CancelTurn so the failure path can
+	// fall through to normalCleanup without a double-unlock" arrangement is no
+	// longer needed: the failure path re-acquires the lock before entering
+	// normalCleanup, so the unlock in normalCleanup is always the matching
+	// one. Delete on an already-absent key is a no-op, so the window opened
+	// here is benign.
+	//
+	// CancelTurn implementations must NOT acquire e.interactiveMu themselves —
+	// they operate on the agent subprocess's own state (stdin write, waiting
+	// for its result event) and don't touch engine bookkeeping.
 	if canceller, ok := agentSession.(AgentSessionCanceller); ok && agentSession != nil {
-		cancelErr := canceller.CancelTurn()
-		if cancelErr != nil {
-			slog.Warn("agent session CancelTurn failed, falling back to Close",
-				"session_key", sessionKey, "error", cancelErr)
-			// Fall through to normalCleanup below — keep lock held.
-			goto normalCleanup
-		}
-
-		// Canceller succeeded. Now release the lock and finalize state.
+		// Keep the state in the map so the next message reuses this session.
+		// Don't markStopped — the session is still usable.
+		// Don't delete from interactiveStates — keep it alive.
 		e.interactiveMu.Unlock()
 
 		if pending != nil {
@@ -10721,11 +10727,17 @@ func (e *Engine) stopInteractiveSessionWithOptions(sessionKey string, notifyQueu
 		state.eventsNeedResync = true
 		state.mu.Unlock()
 
+		if cancelErr := canceller.CancelTurn(); cancelErr != nil {
+			slog.Warn("agent session CancelTurn failed, falling back to Close",
+				"session_key", sessionKey, "error", cancelErr)
+			// Re-acquire the lock that normalCleanup releases.
+			e.interactiveMu.Lock()
+			goto normalCleanup
+		}
+
 		// Release the busy lock: the turn is over, so the session must not stay
 		// locked against the next user message. Kept from the upstream (HEAD)
-		// side of the rebase; the duplicate CancelTurn() call that came with it
-		// is dropped because the canceller is already invoked above, with
-		// interactiveMu held.
+		// side of the rebase.
 		if state.busySession != nil && state.busySession.ForceUnlock() {
 			slog.Info("session busy lock released after turn cancel", "session_key", sessionKey)
 		}
