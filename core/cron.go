@@ -38,7 +38,22 @@ type CronJob struct {
 	CreatedAt   time.Time `json:"created_at"`
 	LastRun     time.Time `json:"last_run,omitempty"`
 	LastError   string    `json:"last_error,omitempty"`
+
+	// QuietHours is a daily window of the form "HH:MM-HH:MM" during which the
+	// job runs in a reduced mode. Empty = quiet hours disabled. A window whose
+	// start is greater than its end ("23:00-08:00") spans midnight.
+	QuietHours string `json:"quiet_hours,omitempty"`
+	// QuietIntervalMins is the wake-up interval (in minutes) used while the
+	// job is inside its quiet-hours window. 0 = quiet behaviour disabled.
+	QuietIntervalMins int `json:"quiet_interval_mins,omitempty"`
+	// WarmPrompt is the prompt sent to the agent during quiet hours.
+	// Empty = use DefaultWarmPrompt.
+	WarmPrompt string `json:"warm_prompt,omitempty"`
 }
+
+// DefaultWarmPrompt is the prompt used to warm a job up during quiet hours:
+// the agent must answer without touching the workspace.
+const DefaultWarmPrompt = "Reply OK only. Do not call any tools, read files, or run commands."
 
 // IsShellJob returns true if the job runs a shell command directly.
 func (j *CronJob) IsShellJob() bool {
@@ -86,6 +101,143 @@ func NormalizeCronSessionMode(s string) string {
 	}
 }
 
+// ParseQuietHours parses a quiet-hours window of the form "HH:MM-HH:MM" into
+// its start and end bounds, expressed as minutes from midnight.
+//
+// An empty (or blank) spec disables quiet hours: active is false and err is
+// nil. A window whose bounds are equal ("08:00-08:00") is likewise disabled —
+// it describes an empty window. A window whose start is greater than its end
+// ("23:00-08:00") is legal and spans midnight.
+//
+// The returned bounds are always the parsed values, even when the window is
+// inactive, so callers can report what was configured.
+func ParseQuietHours(spec string) (startMin, endMin int, active bool, err error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return 0, 0, false, nil
+	}
+
+	parts := strings.Split(spec, "-")
+	if len(parts) != 2 {
+		return 0, 0, false, fmt.Errorf("invalid quiet_hours %q: expected HH:MM-HH:MM", spec)
+	}
+
+	startMin, err = parseClockMinutes(parts[0])
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("invalid quiet_hours %q: %w", spec, err)
+	}
+	endMin, err = parseClockMinutes(parts[1])
+	if err != nil {
+		return 0, 0, false, fmt.Errorf("invalid quiet_hours %q: %w", spec, err)
+	}
+
+	// Equal bounds describe an empty window: quiet hours are disabled.
+	if startMin == endMin {
+		return startMin, endMin, false, nil
+	}
+	return startMin, endMin, true, nil
+}
+
+// parseClockMinutes parses a "HH:MM" clock time into minutes from midnight.
+func parseClockMinutes(s string) (int, error) {
+	clock := strings.TrimSpace(s)
+	t, err := time.Parse("15:04", clock)
+	if err != nil {
+		return 0, fmt.Errorf("invalid time %q: %w", clock, err)
+	}
+	return t.Hour()*60 + t.Minute(), nil
+}
+
+// quietAction describes what the scheduler does with a job that came due.
+type quietAction int
+
+const (
+	// quietRun: run the job normally (outside the quiet-hours window).
+	quietRun quietAction = iota
+	// quietSkip: do not run the job at all.
+	quietSkip
+	// quietWarm: run a reduced "warm" version of the job (warm prompt, muted).
+	quietWarm
+)
+
+// String implements fmt.Stringer so the action can be logged.
+func (a quietAction) String() string {
+	switch a {
+	case quietRun:
+		return "run"
+	case quietSkip:
+		return "skip"
+	case quietWarm:
+		return "warm"
+	default:
+		return "unknown"
+	}
+}
+
+// quietActionAt decides what to do with the job at the given instant.
+//
+// Outside the configured quiet-hours window the job runs normally — the
+// quiet-hours feature never changes behaviour outside the window. Inside the
+// window the job is skipped, unless it is eligible for a warm-up: the warm
+// interval must have elapsed since the last run. A job that never ran warms
+// up immediately.
+func (j *CronJob) quietActionAt(now time.Time) quietAction {
+	if j == nil {
+		return quietSkip
+	}
+	startMin, endMin, active, err := ParseQuietHours(j.QuietHours)
+	if err != nil || !active {
+		// A missing or unparsable window never suppresses a run.
+		return quietRun
+	}
+	if !inQuietWindow(now.Hour()*60+now.Minute(), startMin, endMin) {
+		return quietRun
+	}
+	// Inside the window: a shell job has no warm-up variant, a fresh
+	// session per run is too expensive to ping, and a job without a warm
+	// interval is simply held back until the window closes.
+	if j.IsShellJob() || j.UsesNewSessionPerRun() || j.QuietIntervalMins <= 0 {
+		return quietSkip
+	}
+	if j.LastRun.IsZero() {
+		return quietWarm
+	}
+	if now.Sub(j.LastRun) >= time.Duration(j.QuietIntervalMins)*time.Minute {
+		return quietWarm
+	}
+	return quietSkip
+}
+
+// inQuietWindow reports whether the given minute of the day falls inside the
+// [start, end) quiet window, i.e. the start minute belongs to the window
+// while the end minute does not. A window whose start is greater than its end
+// spans midnight.
+func inQuietWindow(min, startMin, endMin int) bool {
+	if startMin <= endMin {
+		return min >= startMin && min < endMin
+	}
+	return min >= startMin || min < endMin
+}
+
+// warmSnapshot returns a copy of the job reduced to a warm-up ping: the
+// prompt is replaced by the warm prompt and every message is muted. The
+// original job is left untouched. The copy keeps the job ID so the store
+// refreshes the original job's LastRun after the run — that timestamp is what
+// rate-limits the next warm-up inside the quiet window.
+func (j *CronJob) warmSnapshot() *CronJob {
+	if j == nil {
+		return nil
+	}
+	snap := *j
+	prompt := strings.TrimSpace(j.WarmPrompt)
+	if prompt == "" {
+		prompt = DefaultWarmPrompt
+	}
+	snap.Prompt = prompt
+	snap.Mute = true
+	return &snap
+}
+
 func validateCronJob(j *CronJob) error {
 	// SessionKey anchors the cron execution to a platform (ExecuteCronJob
 	// derives platformName from the prefix before ":"). Without it the job
@@ -109,6 +261,19 @@ func validateCronJob(j *CronJob) error {
 	}
 	if j.TimeoutMins != nil && *j.TimeoutMins < 0 {
 		return fmt.Errorf("timeout_mins must be >= 0")
+	}
+	if j.QuietIntervalMins < 0 {
+		return fmt.Errorf("quiet_interval_mins must be >= 0")
+	}
+	// A quiet interval without a window would silently reduce the job to
+	// nothing, so require the window whenever the interval is meaningful.
+	if j.QuietIntervalMins > 0 && strings.TrimSpace(j.QuietHours) == "" {
+		return fmt.Errorf("quiet_hours is required when quiet_interval_mins > 0")
+	}
+	if strings.TrimSpace(j.QuietHours) != "" {
+		if _, _, _, err := ParseQuietHours(j.QuietHours); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -375,6 +540,25 @@ func updateJobField(job *CronJob, field string, value any) error {
 			job.TimeoutMins = &v
 			return nil
 		}
+	case "quiet_hours":
+		if v, ok := value.(string); ok {
+			job.QuietHours = v
+			return nil
+		}
+	case "quiet_interval_mins":
+		if v, ok := value.(float64); ok {
+			job.QuietIntervalMins = int(v)
+			return nil
+		}
+		if v, ok := value.(int); ok {
+			job.QuietIntervalMins = v
+			return nil
+		}
+	case "warm_prompt":
+		if v, ok := value.(string); ok {
+			job.WarmPrompt = v
+			return nil
+		}
 	}
 	// Fallback: try to set string field via reflection
 	if v, ok := value.(string); ok {
@@ -635,7 +819,17 @@ func (cs *CronScheduler) fireDueJobs() {
 	for _, e := range due {
 		job := cs.store.Get(e.jobID)
 		if job != nil {
-			cs.runJob(job, false)
+			switch job.quietActionAt(now) {
+			case quietSkip:
+				// Skipped jobs still have their schedule advanced below, so
+				// the scheduler does not spin on them.
+				slog.Info("cron: job skipped during quiet hours", "id", job.ID, "project", job.Project)
+			case quietWarm:
+				slog.Info("cron: warm-up run during quiet hours", "id", job.ID, "project", job.Project)
+				cs.runJob(job.warmSnapshot(), false)
+			default:
+				cs.runJob(job, false)
+			}
 		}
 
 		// Advance nextRun under the write lock so concurrent
@@ -740,6 +934,58 @@ func (cs *CronScheduler) UpdateJob(id string, field string, value any) error {
 			mode := NormalizeCronSessionMode(v)
 			if mode != "" && mode != "new_per_run" {
 				return fmt.Errorf("invalid session_mode %q (want reuse, new_per_run, or new-per-run)", v)
+			}
+		}
+	}
+
+	// Validate the quiet-hours fields up-front, for the same reason as
+	// "enabled" below: a bad value must not reach the persisted job.
+	//
+	// The two fields are only meaningful together — an interval with no
+	// window would silently mute the job, which is exactly what
+	// validateCronJob rejects on /cron/add. So check the *combination* this
+	// update would produce (stored job + incoming field/value), not just
+	// the field being written: the socket API calls UpdateJob directly and
+	// has no validateCronQuietPatch in front of it, so per-field checks
+	// alone let `cron edit <id> quiet_interval_mins 60` leave behind a job
+	// that /cron/add would refuse.
+	quietHours := job.QuietHours
+	quietInterval := job.QuietIntervalMins
+	switch field {
+	case "quiet_interval_mins":
+		var mins int
+		switch v := value.(type) {
+		case float64:
+			mins = int(v)
+		case int:
+			mins = v
+		default:
+			return fmt.Errorf("quiet_interval_mins must be a number")
+		}
+		if mins < 0 {
+			return fmt.Errorf("quiet_interval_mins must be >= 0")
+		}
+		quietInterval = mins
+	case "quiet_hours":
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("quiet_hours must be a string")
+		}
+		if _, _, _, err := ParseQuietHours(v); err != nil {
+			return err
+		}
+		quietHours = v
+	}
+	if field == "quiet_interval_mins" || field == "quiet_hours" {
+		if quietInterval < 0 {
+			return fmt.Errorf("quiet_interval_mins must be >= 0")
+		}
+		if quietInterval > 0 && strings.TrimSpace(quietHours) == "" {
+			return fmt.Errorf("quiet_hours is required when quiet_interval_mins > 0")
+		}
+		if strings.TrimSpace(quietHours) != "" {
+			if _, _, _, err := ParseQuietHours(quietHours); err != nil {
+				return err
 			}
 		}
 	}

@@ -15,6 +15,11 @@ export interface CronJob {
   session_mode: string;
   mode: string;
   timeout_mins: number | null;
+  // Quiet-hours configuration. The server omits them when unset, so they can
+  // be undefined at runtime even though the type says otherwise.
+  quiet_hours: string;
+  quiet_interval_mins: number;
+  warm_prompt: string;
   created_at: string;
   last_run: string;
   last_error: string;
