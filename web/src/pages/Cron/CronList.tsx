@@ -2,7 +2,7 @@ import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import {
   Clock, Play, Plus, Trash2, Terminal, MessageSquare, Power,
-  ChevronDown,
+  ChevronDown, Moon,
 } from 'lucide-react';
 import { Button, Badge, Modal, Input, Textarea, EmptyState } from '@/components/ui';
 import { listCronJobs, createCronJob, updateCronJob, deleteCronJob, triggerCronJob, type CronJob } from '@/api/cron';
@@ -167,13 +167,42 @@ interface JobForm {
   silent: boolean;
   enabled: boolean;
   mode: string;
+  // Quiet hours. The interval is edited as free text so that an empty input
+  // is representable; on the wire it is a JSON number.
+  quiet_hours: string;
+  quiet_interval_mins: string;
+  warm_prompt: string;
   _type: 'prompt' | 'exec';
 }
 
 const emptyForm: JobForm = {
   project: '', session_key: '', cron_expr: '', prompt: '', exec: '',
-  description: '', silent: false, enabled: true, mode: '', _type: 'prompt',
+  description: '', silent: false, enabled: true, mode: '',
+  quiet_hours: '', quiet_interval_mins: '', warm_prompt: '',
+  _type: 'prompt',
 };
+
+/* ── Quiet-hours helpers ── */
+
+// parseQuietInterval turns the free-text interval field into the number the
+// API expects. An empty field means "no interval" (0), and a negative value
+// is clamped to 0 because the server rejects it.
+function parseQuietInterval(raw: string): number {
+  const n = parseInt(raw.trim(), 10);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return n;
+}
+
+// quietConfig derives the quiet-hours payload from the form.
+//
+// The server only accepts an interval together with a window, so an empty
+// window forces the interval to 0: that is what "clear the quiet hours"
+// means, and it keeps the PATCH valid.
+function quietConfig(form: JobForm): { hours: string; interval: number } {
+  const hours = form.quiet_hours.trim();
+  const interval = hours ? parseQuietInterval(form.quiet_interval_mins) : 0;
+  return { hours, interval };
+}
 
 /* ── Main page ── */
 export default function CronList() {
@@ -246,6 +275,9 @@ export default function CronList() {
       silent: !!job.silent,
       enabled: job.enabled,
       mode: job.mode || '',
+      quiet_hours: job.quiet_hours || '',
+      quiet_interval_mins: job.quiet_interval_mins ? String(job.quiet_interval_mins) : '',
+      warm_prompt: job.warm_prompt || '',
       _type: job.exec ? 'exec' : 'prompt',
     });
     setShowForm(true);
@@ -255,9 +287,16 @@ export default function CronList() {
     setSaving(true);
     const activePrompt = form._type === 'prompt' ? form.prompt : '';
     const activeExec   = form._type === 'exec'   ? form.exec   : '';
+    const quiet = quietConfig(form);
     try {
       if (isEdit && editJob) {
         const updates: Record<string, any> = {};
+        // The quiet hours are patched first and the interval second: the
+        // interval is only valid together with a window, so the window has
+        // to be applied before the interval that belongs to it.
+        if (quiet.hours !== (editJob.quiet_hours || '')) updates.quiet_hours = quiet.hours;
+        if (quiet.interval !== (editJob.quiet_interval_mins || 0)) updates.quiet_interval_mins = quiet.interval;
+        if (form.warm_prompt !== (editJob.warm_prompt || '')) updates.warm_prompt = form.warm_prompt;
         if (form.cron_expr !== editJob.cron_expr) updates.cron_expr = form.cron_expr;
         if (form.description !== editJob.description) updates.description = form.description;
         if (activePrompt !== editJob.prompt) updates.prompt = activePrompt;
@@ -273,6 +312,8 @@ export default function CronList() {
       } else {
         const body: any = { ...form, prompt: activePrompt, exec: activeExec };
         delete body._type;
+        // The interval travels as a number, never as the raw text field.
+        body.quiet_interval_mins = quiet.interval;
         if (!body.prompt) delete body.prompt;
         if (!body.exec) delete body.exec;
         await createCronJob(body);
@@ -360,6 +401,11 @@ export default function CronList() {
                   {describeCron(job.cron_expr)}
                 </span>
                 {job.silent && <Badge variant="default" className="text-[10px] px-1.5 py-0">silent</Badge>}
+                {job.quiet_hours && (
+                  <Badge variant="default" className="text-[10px] px-1.5 py-0 gap-1 font-mono">
+                    <Moon size={9} /> {job.quiet_hours}
+                  </Badge>
+                )}
                 <Badge variant="default" className="text-[10px] px-1.5 py-0">{job.mode || t('cron.modeDefault')}</Badge>
               </div>
 
@@ -379,6 +425,24 @@ export default function CronList() {
                   <div className="flex items-center gap-1.5">
                     <span className="font-medium w-12 shrink-0 text-gray-400">{t('cron.exec')}</span>
                     <code className="truncate text-[11px]">{job.exec}</code>
+                  </div>
+                )}
+                {job.quiet_hours && (
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-medium w-24 shrink-0 text-gray-400">{t('cron.quietHours')}</span>
+                    <code className="truncate text-[11px]">{job.quiet_hours}</code>
+                  </div>
+                )}
+                {job.quiet_interval_mins > 0 && (
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-medium w-24 shrink-0 text-gray-400">{t('cron.quietInterval')}</span>
+                    <span>{job.quiet_interval_mins}</span>
+                  </div>
+                )}
+                {job.warm_prompt && (
+                  <div className="flex items-start gap-1.5">
+                    <span className="font-medium w-24 shrink-0 text-gray-400">{t('cron.warmPrompt')}</span>
+                    <span className="line-clamp-2">{job.warm_prompt}</span>
                   </div>
                 )}
                 {job.last_run && (
@@ -528,6 +592,31 @@ export default function CronList() {
             onChange={v => setForm({ ...form, mode: v })}
             options={MODE_OPTIONS.map(m => ({ value: m, label: m }))}
             placeholder={t('cron.modeDefault')}
+          />
+
+          {/* Quiet hours: the window during which the job is muted */}
+          <Input
+            label={t('cron.quietHours')}
+            value={form.quiet_hours}
+            onChange={e => setForm({ ...form, quiet_hours: e.target.value })}
+            placeholder="23:00-08:00"
+            className="font-mono text-xs"
+          />
+
+          <Input
+            label={t('cron.quietInterval')}
+            type="number"
+            min={0}
+            value={form.quiet_interval_mins}
+            onChange={e => setForm({ ...form, quiet_interval_mins: e.target.value })}
+            placeholder="0"
+          />
+
+          <Input
+            label={t('cron.warmPrompt')}
+            value={form.warm_prompt}
+            onChange={e => setForm({ ...form, warm_prompt: e.target.value })}
+            placeholder={t('cron.warmPromptPlaceholder')}
           />
 
           <div className="flex items-center gap-6 pt-1">

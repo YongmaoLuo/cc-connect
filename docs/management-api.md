@@ -869,11 +869,29 @@ Lists all cron jobs, optionally filtered by project.
         "created_at": "2026-03-10T08:00:00Z",
         "last_run": "2026-03-10T06:00:00Z",
         "last_error": ""
+      },
+      {
+        "id": "cron_def456",
+        "project": "my-backend",
+        "session_key": "telegram:123:456",
+        "cron_expr": "*/30 * * * *",
+        "prompt": "Check the build",
+        "description": "Build monitor",
+        "enabled": true,
+        "quiet_hours": "23:00-08:00",
+        "quiet_interval_mins": 60,
+        "warm_prompt": "Reply OK only.",
+        "created_at": "2026-03-10T08:00:00Z",
+        "last_run": "2026-03-10T06:00:00Z",
+        "last_error": ""
       }
     ]
   }
 }
 ```
+
+The `quiet_hours`, `quiet_interval_mins` and `warm_prompt` fields are omitted
+from the response when they are not set.
 
 ---
 
@@ -920,6 +938,16 @@ Adds a cron job. Either `prompt` or `exec` must be provided, not both.
 | `silent`     | boolean | no       | Suppress start notification                   |
 | `session_mode` | string | no       | `reuse` (default) or `new_per_run` — new agent session each run |
 | `timeout_mins` | int    | no       | Scheduler wait per run: omit = 30 min, `0` = no time limit |
+| `quiet_hours` | string  | no       | Daily quiet-hours window `HH:MM-HH:MM`; omit = disabled |
+| `quiet_interval_mins` | int | no      | Wake-up interval inside the quiet window; requires `quiet_hours` |
+| `warm_prompt` | string  | no       | Prompt used during quiet hours (default: reply OK only) |
+
+**Quiet hours:** when `quiet_hours` is set, a job that comes due inside the
+window does not run normally. It is skipped and — when `quiet_interval_mins`
+is set — woken up at most that often with the warm prompt, muted, so nothing
+is written to the chat. Shell jobs (`exec`) and jobs with
+`session_mode: new_per_run` are always skipped inside the window. Outside the
+window the job runs exactly as before.
 
 **Response:**
 
@@ -934,6 +962,59 @@ Adds a cron job. Either `prompt` or `exec` must be provided, not both.
     "prompt": "Summarize GitHub trending",
     "description": "Daily GitHub Trending",
     "enabled": true,
+    "created_at": "2026-03-10T10:40:00Z"
+  }
+}
+```
+
+---
+
+#### PATCH /api/v1/cron/{id}
+
+Updates a cron job. Only the provided fields are updated.
+
+**Request body:**
+
+```json
+{
+  "quiet_hours": "23:00-08:00",
+  "quiet_interval_mins": 60,
+  "warm_prompt": "Reply OK only."
+}
+```
+
+| Field                | Type   | Description |
+|----------------------|--------|-------------|
+| `quiet_hours`        | string | Daily quiet-hours window `HH:MM-HH:MM`; omit = disabled. A window whose start is later than its end (`23:00-08:00`) spans midnight. |
+| `quiet_interval_mins`| int    | Wake-up interval used inside the quiet window. Requires `quiet_hours`; `0` = the job is simply held back until the window closes. |
+| `warm_prompt`        | string | Prompt sent to the agent during quiet hours. Default: `Reply OK only. Do not call any tools, read files, or run commands.` |
+
+The other updatable fields are `project`, `session_key`, `cron_expr`,
+`prompt`, `exec`, `work_dir`, `description`, `enabled`, `silent`, `mute`,
+`session_mode`, `mode` and `timeout_mins`. `id`, `created_at`, `last_run` and
+`last_error` are read-only.
+
+`quiet_hours` and `quiet_interval_mins` are only valid together: a request
+that would leave the job with an interval but no window is rejected with
+`400`. The fields are applied in a fixed order, so the result does not depend
+on the order of the JSON object.
+
+**Response:**
+
+```json
+{
+  "ok": true,
+  "data": {
+    "id": "cron_xyz789",
+    "project": "my-backend",
+    "session_key": "telegram:123:456",
+    "cron_expr": "0 6 * * *",
+    "prompt": "Summarize GitHub trending",
+    "description": "Daily GitHub Trending",
+    "enabled": true,
+    "quiet_hours": "23:00-08:00",
+    "quiet_interval_mins": 60,
+    "warm_prompt": "Reply OK only.",
     "created_at": "2026-03-10T10:40:00Z"
   }
 }

@@ -58,7 +58,8 @@ func closeCronResponseBody(body io.Closer) {
 
 func runCronAdd(args []string) {
 	var project, sessionKey, cronExpr, prompt, execCmd, desc, dataDir, sessionMode string
-	var timeoutMins *int
+	var quietHours, warmPrompt string
+	var timeoutMins, quietIntervalMins *int
 	var silent bool
 
 	var positional []string
@@ -113,6 +114,26 @@ func runCronAdd(args []string) {
 					os.Exit(1)
 				}
 				timeoutMins = &n
+			}
+		case "--quiet-hours":
+			if i+1 < len(args) {
+				i++
+				quietHours = args[i]
+			}
+		case "--quiet-interval-mins":
+			if i+1 < len(args) {
+				i++
+				n, err := strconv.Atoi(args[i])
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: invalid --quiet-interval-mins: %v\n", err)
+					os.Exit(1)
+				}
+				quietIntervalMins = &n
+			}
+		case "--warm-prompt":
+			if i+1 < len(args) {
+				i++
+				warmPrompt = args[i]
 			}
 		case "--silent":
 			silent = true
@@ -174,6 +195,18 @@ func runCronAdd(args []string) {
 	}
 	if timeoutMins != nil {
 		body["timeout_mins"] = *timeoutMins
+	}
+	// Quiet-hours keys are omitted rather than sent as zero values: a job
+	// created without the flags must stay byte-identical to one created by
+	// an older CLI, so old daemons and old jobs.json keep working.
+	if quietHours != "" {
+		body["quiet_hours"] = quietHours
+	}
+	if quietIntervalMins != nil {
+		body["quiet_interval_mins"] = *quietIntervalMins
+	}
+	if warmPrompt != "" {
+		body["warm_prompt"] = warmPrompt
 	}
 	payload, _ := json.Marshal(body)
 
@@ -575,15 +608,16 @@ func parseCronEditValue(field, valueStr string) (any, error) {
 			return nil, fmt.Errorf("%s must be true or false", field)
 		}
 		return v, nil
-	case "timeout_mins":
+	case "timeout_mins", "quiet_interval_mins":
 		v, err := strconv.Atoi(valueStr)
 		if err != nil {
-			return nil, fmt.Errorf("timeout_mins must be an integer")
+			return nil, fmt.Errorf("%s must be an integer", field)
 		}
 		return v, nil
 	default:
 		// String fields: project, session_key, cron_expr, prompt, exec,
-		// work_dir, description, session_mode, mode
+		// work_dir, description, session_mode, mode, quiet_hours,
+		// warm_prompt
 		return valueStr, nil
 	}
 }
@@ -628,6 +662,14 @@ Options:
       --desc <text>          Short description
       --session-mode <mode>  reuse (default) or new-per-run — fresh agent session each run
       --timeout-mins <n>     Max minutes to wait per run (0 = no limit; default 30 if omitted)
+      --quiet-hours <win>    Quiet window "HH:MM-HH:MM" (e.g. 23:00-08:00), may cross midnight;
+                             outside it the job runs at its normal schedule
+      --quiet-interval-mins <n>
+                             Wake-up interval in minutes during the quiet window
+                             (0 = off; requires --quiet-hours)
+      --warm-prompt <text>   Prompt used during the quiet window
+                             (default: "Reply OK only. Do not call any tools, read files,
+                             or run commands.")
       --silent               Suppress cron start notification
       --data-dir <path>      Data directory (default: ~/.cc-connect)
   -h, --help                 Show this help
@@ -636,6 +678,7 @@ Examples:
   cc-connect cron add --cron "0 6 * * *" --prompt "Collect GitHub trending data" --desc "Daily Trending"
   cc-connect cron add --cron "*/30 * * * *" --exec "df -h" --desc "Disk usage check"
   cc-connect cron add --cron "0 9 * * *" --prompt "Daily standup reminder" --silent
+  cc-connect cron add --cron "*/20 * * * *" --prompt "监控" --quiet-hours 23:00-08:00 --quiet-interval-mins 60
   cc-connect cron add 0 6 * * * Collect GitHub trending data and send me a summary`)
 }
 
@@ -667,6 +710,8 @@ Editable Fields (string):
   work_dir      Working directory for exec
   description   Short description
   session_mode  reuse or new_per_run
+  quiet_hours   Quiet window "HH:MM-HH:MM", e.g. "23:00-08:00" (may cross midnight)
+  warm_prompt   Prompt used during the quiet window (empty = built-in default)
 
 Editable Fields (bool: true/false):
   enabled       Enable or disable the task
@@ -674,7 +719,8 @@ Editable Fields (bool: true/false):
   silent        Suppress start notification
 
 Editable Fields (int: number):
-  timeout_mins  Max minutes per run (0 = no limit)
+  timeout_mins        Max minutes per run (0 = no limit)
+  quiet_interval_mins  Wake-up interval in minutes during the quiet window (0 = off)
 
 Read-only Fields (cannot be edited):
   id, created_at, last_run, last_error
@@ -688,5 +734,7 @@ Examples:
   cc-connect cron edit abc123 enabled false
   cc-connect cron edit abc123 description "Daily standup reminder"
   cc-connect cron edit abc123 timeout_mins 60
-  cc-connect cron edit abc123 mute true`)
+  cc-connect cron edit abc123 mute true
+  cc-connect cron edit abc123 quiet_hours "23:00-08:00"
+  cc-connect cron edit abc123 quiet_interval_mins 60`)
 }

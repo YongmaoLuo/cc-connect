@@ -147,7 +147,11 @@
     "selectSessionKey": "Select session (empty for default)",
     "taskType": "Task type",
     "mode": "Permission mode",
-    "modeDefault": "Use project default"
+    "modeDefault": "Use project default",
+    "quietHours": "Quiet hours",
+    "quietInterval": "Quiet interval (min)",
+    "warmPrompt": "Warm-up prompt",
+    "warmPromptPlaceholder": "Prompt used during quiet hours (empty = default)"
   },
   "heartbeat": {
     "title": "Heartbeat",

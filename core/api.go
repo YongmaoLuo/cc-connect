@@ -326,6 +326,15 @@ type CronAddRequest struct {
 	SessionMode string `json:"session_mode,omitempty"`
 	Mode        string `json:"mode,omitempty"`
 	TimeoutMins *int   `json:"timeout_mins,omitempty"`
+
+	// Quiet-hours configuration. QuietHours is a daily "HH:MM-HH:MM" window
+	// during which the job runs in a reduced mode; QuietIntervalMins is the
+	// wake-up interval used inside that window and therefore requires a
+	// window to be set. WarmPrompt overrides the prompt sent to the agent
+	// during quiet hours.
+	QuietHours        string `json:"quiet_hours,omitempty"`
+	QuietIntervalMins int    `json:"quiet_interval_mins,omitempty"`
+	WarmPrompt        string `json:"warm_prompt,omitempty"`
 }
 
 func (s *APIServer) handleCronAdd(w http.ResponseWriter, r *http.Request) {
@@ -405,6 +414,12 @@ func (s *APIServer) handleCronAdd(w http.ResponseWriter, r *http.Request) {
 		SessionMode: NormalizeCronSessionMode(req.SessionMode),
 		Mode:        req.Mode,
 		TimeoutMins: req.TimeoutMins,
+		// Quiet-hours configuration. AddJob validates it, so an invalid
+		// window or an interval without a window is reported as a 400
+		// with the reason.
+		QuietHours:        req.QuietHours,
+		QuietIntervalMins: req.QuietIntervalMins,
+		WarmPrompt:        req.WarmPrompt,
 	}
 	job.CreatedAt = time.Now()
 
