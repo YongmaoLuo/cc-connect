@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1756,6 +1757,12 @@ func (m *ManagementServer) handleCron(w http.ResponseWriter, r *http.Request) {
 			Mode:        req.Mode,
 			TimeoutMins: req.TimeoutMins,
 			CreatedAt:   time.Now(),
+			// Quiet-hours configuration. AddJob validates it, so an invalid
+			// window or an interval without a window is reported as a 400
+			// with the reason.
+			QuietHours:        req.QuietHours,
+			QuietIntervalMins: req.QuietIntervalMins,
+			WarmPrompt:        req.WarmPrompt,
 		}
 		if err := m.cronScheduler.AddJob(job); err != nil {
 			mgmtError(w, http.StatusBadRequest, err.Error())
@@ -1812,8 +1819,18 @@ func (m *ManagementServer) handleCronByID(w http.ResponseWriter, r *http.Request
 			mgmtError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 			return
 		}
-		for field, value := range updates {
-			if err := m.cronScheduler.UpdateJob(id, field, value); err != nil {
+		// The quiet-hours window and its interval are only valid together,
+		// so the combination the PATCH would produce is checked before
+		// anything is persisted: a PATCH must not leave the job in a state
+		// that /cron/add would have rejected.
+		if job := m.cronScheduler.Store().Get(id); job != nil {
+			if err := validateCronQuietPatch(job, updates); err != nil {
+				mgmtError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		for _, field := range cronPatchOrder(updates) {
+			if err := m.cronScheduler.UpdateJob(id, field, updates[field]); err != nil {
 				mgmtError(w, http.StatusBadRequest, fmt.Sprintf("update %s: %s", field, err.Error()))
 				return
 			}
@@ -1846,6 +1863,89 @@ func (m *ManagementServer) handleCronByID(w http.ResponseWriter, r *http.Request
 	default:
 		mgmtError(w, http.StatusMethodNotAllowed, "DELETE, PATCH, or POST only")
 	}
+}
+
+// cronPatchOrder returns the fields of a cron PATCH body in the order they
+// must be applied.
+//
+// Go randomizes map iteration, so applying the fields in map order would make
+// a multi-field PATCH behave differently from one request to the next. The
+// quiet-hours window comes first because the quiet interval is only valid
+// together with a window; the remaining fields follow in a stable
+// alphabetical order.
+func cronPatchOrder(updates map[string]any) []string {
+	priority := map[string]int{
+		"quiet_hours":         0,
+		"quiet_interval_mins": 1,
+		"warm_prompt":         2,
+	}
+	fields := make([]string, 0, len(updates))
+	for field := range updates {
+		fields = append(fields, field)
+	}
+	sort.Slice(fields, func(i, j int) bool {
+		pi, iKnown := priority[fields[i]]
+		pj, jKnown := priority[fields[j]]
+		switch {
+		case iKnown && jKnown:
+			return pi < pj
+		case iKnown:
+			return true
+		case jKnown:
+			return false
+		default:
+			return fields[i] < fields[j]
+		}
+	})
+	return fields
+}
+
+// validateCronQuietPatch checks the quiet-hours configuration a PATCH would
+// produce, without persisting anything.
+//
+// The rules are the ones /cron/add applies: the interval needs a window, and
+// the window must parse. They are checked on the combination the PATCH
+// produces rather than field by field, so the outcome does not depend on the
+// order in which the fields are applied.
+func validateCronQuietPatch(job *CronJob, updates map[string]any) error {
+	hoursValue, hasHours := updates["quiet_hours"]
+	intervalValue, hasInterval := updates["quiet_interval_mins"]
+	if !hasHours && !hasInterval {
+		// The PATCH leaves the quiet-hours configuration alone, so whatever
+		// the stored job has is none of its business.
+		return nil
+	}
+
+	hours := job.QuietHours
+	if hasHours {
+		s, ok := hoursValue.(string)
+		if !ok {
+			return fmt.Errorf("quiet_hours must be a string")
+		}
+		hours = s
+	}
+	interval := job.QuietIntervalMins
+	if hasInterval {
+		switch n := intervalValue.(type) {
+		case float64:
+			interval = int(n)
+		case int:
+			interval = n
+		default:
+			return fmt.Errorf("quiet_interval_mins must be a number")
+		}
+	}
+
+	// validateCronJob owns the quiet-hours rules. A minimal job carrying
+	// only those fields keeps the generic job rules (session key, mode,
+	// ...) out of this check, so a PATCH is never rejected because of a
+	// pre-existing problem in the stored job.
+	probe := &CronJob{
+		SessionKey:        "quiet-hours-check",
+		QuietHours:        hours,
+		QuietIntervalMins: interval,
+	}
+	return validateCronJob(probe)
 }
 
 // ── Bridge endpoints ──────────────────────────────────────────
