@@ -1090,6 +1090,7 @@ app_secret = "your-feishu-app-secret"
 # group_chat_history_share = false
 # 将未 @ 机器人的群消息作为下一次触发的上下文共享；消息本身不会触发回复。
 # reply_to_trigger = true   # Default: bot uses “reply to message” API (quotes the user’s message). Set false to post plain chat messages instead.
+# thread_bootstrap_quote = true  # When false, the first message in a Feishu thread does not pull the parent/root reply chain into the agent context. Requires thread_isolation for effect.
 #                           # 默认 true：用「回复消息」API（引用用户消息）。设为 false 则在会话里发普通消息、不引用触发消息。
 # progress_style = "legacy" # Progress rendering style: legacy | compact | card
 #                           # 进度消息展示风格：legacy（逐条消息）| compact（单消息持续更新）| card（结构化卡片）

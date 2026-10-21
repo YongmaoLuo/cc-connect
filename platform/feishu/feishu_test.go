@@ -367,7 +367,11 @@ func TestOnMessageThreadIsolationBootstrapsExistingThreadContext(t *testing.T) {
 		appSecret:       appSecret,
 		botOpenID:       botOpenID,
 		threadIsolation: true,
-		dedup:           &core.MessageDedup{},
+		// newPlatform defaults thread_bootstrap_quote to true; this test
+		// builds the struct directly, so set the default explicitly to keep
+		// exercising the bootstrap quote.
+		threadBootstrapQuote: true,
+		dedup:                &core.MessageDedup{},
 		client: lark.NewClient(appID, appSecret,
 			lark.WithOpenBaseUrl(srv.URL),
 			lark.WithHttpClient(srv.Client()),
