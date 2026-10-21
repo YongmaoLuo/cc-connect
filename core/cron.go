@@ -40,22 +40,28 @@ type CronJob struct {
 	LastError   string    `json:"last_error,omitempty"`
 
 	// QuietHours is a daily window of the form "HH:MM-HH:MM" during which the
-	// job runs in a reduced mode. Empty = quiet hours disabled. A window whose
-	// start is greater than its end ("23:00-08:00") spans midnight.
+	// job is rate-limited to one run per QuietIntervalMins instead of firing
+	// on every tick. Empty = quiet hours disabled. A window whose start is
+	// greater than its end ("23:00-08:00") spans midnight.
 	QuietHours string `json:"quiet_hours,omitempty"`
-	// QuietIntervalMins is the warm-up interval (in minutes). It has two
-	// uses:
+	// QuietIntervalMins is the interval (in minutes) shared by the two
+	// rate limiters. It has two uses:
 	//
-	//   - with a quiet-hours window: the spacing between the muted warm-up
-	//     pings inside the window;
+	//   - inside a quiet-hours window: the spacing between the runs the
+	//     window still allows. A tick that comes due before the interval has
+	//     elapsed runs nothing at all — not even the precondition — while
+	//     the first tick past the interval goes through the normal
+	//     decision (precondition, then either the real job or a muted
+	//     warm-up ping);
 	//   - without a window (or outside it): the idle warm-up interval. When
 	//     a precondition reports no change the job is skipped, but a muted
 	//     warm-up ping still keeps the model cache fresh once this interval
 	//     has elapsed since the last run.
 	//
-	// 0 = the feature is off: no warm-up at all.
+	// 0 with a window = no rate limiting: the job is held back until the
+	// window closes. 0 without a window = the idle warm-up is off.
 	QuietIntervalMins int `json:"quiet_interval_mins,omitempty"`
-	// WarmPrompt is the prompt sent to the agent during quiet hours.
+	// WarmPrompt is the prompt sent to the agent for the muted warm-up ping.
 	// Empty = use DefaultWarmPrompt.
 	WarmPrompt string `json:"warm_prompt,omitempty"`
 	// Precondition is a shell command guarding the job. Empty = no gate: the
@@ -167,12 +173,11 @@ func parseClockMinutes(s string) (int, error) {
 type quietAction int
 
 const (
-	// quietRun: run the job normally (outside the quiet-hours window).
+	// quietRun: run the job through the normal decision — outside the
+	// quiet-hours window, or inside it once the rate-limit interval elapsed.
 	quietRun quietAction = iota
 	// quietSkip: do not run the job at all.
 	quietSkip
-	// quietWarm: run a reduced "warm" version of the job (warm prompt, muted).
-	quietWarm
 )
 
 // String implements fmt.Stringer so the action can be logged.
@@ -182,8 +187,6 @@ func (a quietAction) String() string {
 		return "run"
 	case quietSkip:
 		return "skip"
-	case quietWarm:
-		return "warm"
 	default:
 		return "unknown"
 	}
@@ -193,14 +196,21 @@ func (a quietAction) String() string {
 //
 // Outside the configured quiet-hours window the job runs normally — the
 // quiet-hours feature never changes behaviour outside the window. Inside the
-// window the job is skipped, unless it is eligible for a warm-up: the warm
-// interval must have elapsed since the last run. A job that never ran warms
-// up immediately.
+// window it is rate-limited rather than suppressed: the job still runs, but
+// at most once per QuietIntervalMins. A tick that comes due before the
+// interval has elapsed is dropped without touching the precondition, and the
+// first tick past it goes through the normal decision (precondition, then
+// either the real job or a muted warm-up ping). A job that never ran is
+// allowed to run immediately.
+//
+// QuietIntervalMins = 0 is the exception: without an interval there is
+// nothing to rate-limit against, so the job is held back until the window
+// closes.
 //
 // The window and the idle warm-up share one interval (QuietIntervalMins):
-// inside the window it paces the warm-up pings, and outside the window —
-// where the job's own precondition decides whether there is anything to do
-// — it paces the idle warm-up (see idleWarmDue).
+// inside the window it paces the runs, and outside the window — where the
+// job's own precondition decides whether there is anything to do — it paces
+// the idle warm-up (see idleWarmDue).
 func (j *CronJob) quietActionAt(now time.Time) quietAction {
 	if j == nil {
 		return quietSkip
@@ -213,17 +223,17 @@ func (j *CronJob) quietActionAt(now time.Time) quietAction {
 	if !inQuietWindow(now.Hour()*60+now.Minute(), startMin, endMin) {
 		return quietRun
 	}
-	// Inside the window: a shell job has no warm-up variant, a fresh
-	// session per run is too expensive to ping, and a job without a warm
-	// interval is simply held back until the window closes.
-	if j.IsShellJob() || j.UsesNewSessionPerRun() || j.QuietIntervalMins <= 0 {
+	// Inside the window: a job without an interval is held back for the
+	// whole window. Everything else — shell jobs and fresh sessions per
+	// run included — is rate-limited to one tick per interval instead.
+	if j.QuietIntervalMins <= 0 {
 		return quietSkip
 	}
 	if j.LastRun.IsZero() {
-		return quietWarm
+		return quietRun
 	}
 	if now.Sub(j.LastRun) >= time.Duration(j.QuietIntervalMins)*time.Minute {
-		return quietWarm
+		return quietRun
 	}
 	return quietSkip
 }
@@ -243,8 +253,11 @@ func inQuietWindow(min, startMin, endMin int) bool {
 // prompt is replaced by the warm prompt and every message is muted. The
 // original job is left untouched. The copy keeps the job ID so the store
 // refreshes the original job's LastRun after the run — that timestamp is what
-// rate-limits the next warm-up, both inside the quiet window and between two
-// idle warm-ups.
+// rate-limits the next idle warm-up.
+//
+// Its only caller is the idle warm-up path in fireDueJobs, reached through
+// idleWarmDue: the quiet-hours window no longer pings on its own, it merely
+// decides whether a due tick runs or is dropped.
 func (j *CronJob) warmSnapshot() *CronJob {
 	if j == nil {
 		return nil
@@ -263,6 +276,10 @@ func (j *CronJob) warmSnapshot() *CronJob {
 // should still run a muted warm-up ping to keep the model cache fresh.
 // A shell job has no warm variant, a fresh session per run is too
 // expensive to ping, and an interval of zero turns the feature off.
+//
+// This is the only remaining path to warmSnapshot: a quiet-hours tick that is
+// allowed through reaches the real job, and only a blocked precondition turns
+// that into a ping.
 func (j *CronJob) idleWarmDue(now time.Time) bool {
 	if j == nil || j.IsShellJob() || j.UsesNewSessionPerRun() || j.QuietIntervalMins <= 0 {
 		return false
@@ -879,12 +896,6 @@ func (cs *CronScheduler) fireDueJobs() {
 				// Skipped jobs still have their schedule advanced below, so
 				// the scheduler does not spin on them.
 				slog.Info("cron: job skipped during quiet hours", "id", job.ID, "project", job.Project)
-			case quietWarm:
-				// The warm-up ping takes priority over the precondition: the
-				// condition guards the real work, not the keep-alive, so a
-				// failing condition must not silence the warm run.
-				slog.Info("cron: warm-up run during quiet hours", "id", job.ID, "project", job.Project)
-				cs.runJob(job.warmSnapshot(), false)
 			default:
 				// A job may guard itself with a precondition command. When
 				// the command blocks, the job is skipped: it does not run and

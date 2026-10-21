@@ -110,9 +110,10 @@ func TestCronQuietIntegration_EndToEnd(t *testing.T) {
 		}
 
 		// The configuration that reached the store is what the scheduler
-		// decides on: inside the window the job warms up.
-		if got := patchedStored.quietActionAt(atClock(23, 30)); got != quietWarm {
-			t.Fatalf("iteration %d: quietActionAt(23:30) = %v, want %v", i, got, quietWarm)
+		// decides on: inside the window the job is rate-limited, and one
+		// that never ran runs on its first due tick.
+		if got := patchedStored.quietActionAt(atClock(23, 30)); got != quietRun {
+			t.Fatalf("iteration %d: quietActionAt(23:30) = %v, want %v", i, got, quietRun)
 		}
 	}
 
@@ -151,7 +152,7 @@ func TestCronQuietIntegration_EndToEnd(t *testing.T) {
 
 	// ── decision ────────────────────────────────────────────────────────
 	// The job that came in through the API decides exactly as it was
-	// configured: warm inside the window, normal outside it.
+	// configured: rate-limited inside the window, normal outside it.
 	final := store.Get(job.ID)
 	if final == nil {
 		t.Fatal("job not found in store")
@@ -159,8 +160,8 @@ func TestCronQuietIntegration_EndToEnd(t *testing.T) {
 	if final.QuietHours != "23:00-08:00" {
 		t.Errorf("final QuietHours = %q, want %q", final.QuietHours, "23:00-08:00")
 	}
-	if got := final.quietActionAt(atClock(23, 30)); got != quietWarm {
-		t.Errorf("quietActionAt(23:30) = %v, want %v", got, quietWarm)
+	if got := final.quietActionAt(atClock(23, 30)); got != quietRun {
+		t.Errorf("quietActionAt(23:30) = %v, want %v", got, quietRun)
 	}
 	if got := final.quietActionAt(atClock(12, 0)); got != quietRun {
 		t.Errorf("quietActionAt(12:00) = %v, want %v", got, quietRun)
