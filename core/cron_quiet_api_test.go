@@ -247,8 +247,9 @@ func TestCronQuietAPI_PatchFieldOrder(t *testing.T) {
 }
 
 // TestCronQuietAPI_RejectsInvalid checks that a malformed quiet-hours window
-// and a quiet interval without a window are rejected with 400 and a reason,
-// on both the add and the patch path.
+// is rejected with 400 and a reason, on both the add and the patch path, and
+// that a quiet interval without a window is accepted on both: without a
+// window the interval paces the idle warm-up.
 func TestCronQuietAPI_RejectsInvalid(t *testing.T) {
 	api, _ := newQuietTestAPIServer(t)
 
@@ -275,7 +276,7 @@ func TestCronQuietAPI_RejectsInvalid(t *testing.T) {
 		}
 	})
 
-	t.Run("add with interval but no window", func(t *testing.T) {
+	t.Run("add with interval but no window is accepted", func(t *testing.T) {
 		body, err := json.Marshal(map[string]any{
 			"project":             "test",
 			"session_key":         "test:chan:user",
@@ -290,11 +291,17 @@ func TestCronQuietAPI_RejectsInvalid(t *testing.T) {
 		rec := httptest.NewRecorder()
 		api.handleCronAdd(rec, req)
 
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+		// Without a window the interval paces the idle warm-up, so the job
+		// is valid on its own.
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
 		}
-		if !strings.Contains(rec.Body.String(), "quiet_hours") {
-			t.Errorf("body should explain the missing quiet_hours, got: %s", rec.Body.String())
+		var job CronJob
+		if err := json.Unmarshal(rec.Body.Bytes(), &job); err != nil {
+			t.Fatalf("unmarshal job: %v", err)
+		}
+		if job.QuietIntervalMins != 60 {
+			t.Errorf("added QuietIntervalMins = %d, want 60", job.QuietIntervalMins)
 		}
 	})
 
@@ -358,19 +365,16 @@ func TestCronQuietAPI_RejectsInvalid(t *testing.T) {
 		}
 	})
 
-	t.Run("patch with interval but no window", func(t *testing.T) {
+	t.Run("patch with interval but no window is accepted", func(t *testing.T) {
 		id := addJob(t)
 		status, r := mgmtRequestWithStatus(t, http.MethodPatch, ts.URL+"/api/v1/cron/"+id, "tok", map[string]any{
 			"quiet_interval_mins": 60,
 		})
-		if status != http.StatusBadRequest {
-			t.Fatalf("status = %d, want 400; error=%s", status, r.Error)
+		if status != http.StatusOK {
+			t.Fatalf("status = %d, want 200; error=%s", status, r.Error)
 		}
-		if !strings.Contains(r.Error, "quiet_hours") {
-			t.Errorf("error should explain the missing quiet_hours, got: %s", r.Error)
-		}
-		if got := store.Get(id).QuietIntervalMins; got != 0 {
-			t.Errorf("stored QuietIntervalMins = %d after rejected patch, want 0", got)
+		if got := store.Get(id).QuietIntervalMins; got != 60 {
+			t.Errorf("stored QuietIntervalMins = %d, want 60", got)
 		}
 	})
 }

@@ -43,8 +43,17 @@ type CronJob struct {
 	// job runs in a reduced mode. Empty = quiet hours disabled. A window whose
 	// start is greater than its end ("23:00-08:00") spans midnight.
 	QuietHours string `json:"quiet_hours,omitempty"`
-	// QuietIntervalMins is the wake-up interval (in minutes) used while the
-	// job is inside its quiet-hours window. 0 = quiet behaviour disabled.
+	// QuietIntervalMins is the warm-up interval (in minutes). It has two
+	// uses:
+	//
+	//   - with a quiet-hours window: the spacing between the muted warm-up
+	//     pings inside the window;
+	//   - without a window (or outside it): the idle warm-up interval. When
+	//     a precondition reports no change the job is skipped, but a muted
+	//     warm-up ping still keeps the model cache fresh once this interval
+	//     has elapsed since the last run.
+	//
+	// 0 = the feature is off: no warm-up at all.
 	QuietIntervalMins int `json:"quiet_interval_mins,omitempty"`
 	// WarmPrompt is the prompt sent to the agent during quiet hours.
 	// Empty = use DefaultWarmPrompt.
@@ -187,6 +196,11 @@ func (a quietAction) String() string {
 // window the job is skipped, unless it is eligible for a warm-up: the warm
 // interval must have elapsed since the last run. A job that never ran warms
 // up immediately.
+//
+// The window and the idle warm-up share one interval (QuietIntervalMins):
+// inside the window it paces the warm-up pings, and outside the window —
+// where the job's own precondition decides whether there is anything to do
+// — it paces the idle warm-up (see idleWarmDue).
 func (j *CronJob) quietActionAt(now time.Time) quietAction {
 	if j == nil {
 		return quietSkip
@@ -229,7 +243,8 @@ func inQuietWindow(min, startMin, endMin int) bool {
 // prompt is replaced by the warm prompt and every message is muted. The
 // original job is left untouched. The copy keeps the job ID so the store
 // refreshes the original job's LastRun after the run — that timestamp is what
-// rate-limits the next warm-up inside the quiet window.
+// rate-limits the next warm-up, both inside the quiet window and between two
+// idle warm-ups.
 func (j *CronJob) warmSnapshot() *CronJob {
 	if j == nil {
 		return nil
@@ -242,6 +257,20 @@ func (j *CronJob) warmSnapshot() *CronJob {
 	snap.Prompt = prompt
 	snap.Mute = true
 	return &snap
+}
+
+// idleWarmDue reports whether a job whose precondition found no change
+// should still run a muted warm-up ping to keep the model cache fresh.
+// A shell job has no warm variant, a fresh session per run is too
+// expensive to ping, and an interval of zero turns the feature off.
+func (j *CronJob) idleWarmDue(now time.Time) bool {
+	if j == nil || j.IsShellJob() || j.UsesNewSessionPerRun() || j.QuietIntervalMins <= 0 {
+		return false
+	}
+	if j.LastRun.IsZero() {
+		return true
+	}
+	return now.Sub(j.LastRun) >= time.Duration(j.QuietIntervalMins)*time.Minute
 }
 
 func validateCronJob(j *CronJob) error {
@@ -271,11 +300,8 @@ func validateCronJob(j *CronJob) error {
 	if j.QuietIntervalMins < 0 {
 		return fmt.Errorf("quiet_interval_mins must be >= 0")
 	}
-	// A quiet interval without a window would silently reduce the job to
-	// nothing, so require the window whenever the interval is meaningful.
-	if j.QuietIntervalMins > 0 && strings.TrimSpace(j.QuietHours) == "" {
-		return fmt.Errorf("quiet_hours is required when quiet_interval_mins > 0")
-	}
+	// The interval no longer needs a window: without one it paces the idle
+	// warm-up (see idleWarmDue). Only the window's own syntax is checked.
 	if strings.TrimSpace(j.QuietHours) != "" {
 		if _, _, _, err := ParseQuietHours(j.QuietHours); err != nil {
 			return err
@@ -867,6 +893,17 @@ func (cs *CronScheduler) fireDueJobs() {
 				if strings.TrimSpace(job.Precondition) != "" {
 					allow, code, out := runPrecondition(job, now)
 					if !allow {
+						// No update: the real work is skipped, but the model
+						// cache would go cold. Once the idle interval has
+						// elapsed, a muted warm-up ping keeps it fresh
+						// without doing any work.
+						if job.idleWarmDue(now) {
+							slog.Info("cron: idle warm-up run",
+								"id", job.ID, "project", job.Project,
+								"precondition_exit", code, "last_run", job.LastRun)
+							cs.runJob(job.warmSnapshot(), false)
+							break
+						}
 						slog.Info("cron: precondition skipped job",
 							"id", job.ID, "project", job.Project, "exit", code,
 							"output", truncatePreconditionOutput(out))
@@ -986,14 +1023,11 @@ func (cs *CronScheduler) UpdateJob(id string, field string, value any) error {
 	// Validate the quiet-hours fields up-front, for the same reason as
 	// "enabled" below: a bad value must not reach the persisted job.
 	//
-	// The two fields are only meaningful together — an interval with no
-	// window would silently mute the job, which is exactly what
-	// validateCronJob rejects on /cron/add. So check the *combination* this
-	// update would produce (stored job + incoming field/value), not just
-	// the field being written: the socket API calls UpdateJob directly and
-	// has no validateCronQuietPatch in front of it, so per-field checks
-	// alone let `cron edit <id> quiet_interval_mins 60` leave behind a job
-	// that /cron/add would refuse.
+	// The interval is no longer tied to the window: with one it paces the
+	// warm-up pings inside the quiet window, without one it paces the idle
+	// warm-up (see idleWarmDue). So the combination is no longer rejected —
+	// only the interval's own bounds and the window's syntax are checked,
+	// and the window may be cleared while an interval is set.
 	quietHours := job.QuietHours
 	quietInterval := job.QuietIntervalMins
 	switch field {
@@ -1024,9 +1058,6 @@ func (cs *CronScheduler) UpdateJob(id string, field string, value any) error {
 	if field == "quiet_interval_mins" || field == "quiet_hours" {
 		if quietInterval < 0 {
 			return fmt.Errorf("quiet_interval_mins must be >= 0")
-		}
-		if quietInterval > 0 && strings.TrimSpace(quietHours) == "" {
-			return fmt.Errorf("quiet_hours is required when quiet_interval_mins > 0")
 		}
 		if strings.TrimSpace(quietHours) != "" {
 			if _, _, _, err := ParseQuietHours(quietHours); err != nil {

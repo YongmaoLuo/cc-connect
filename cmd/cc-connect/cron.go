@@ -695,8 +695,10 @@ Options:
       --quiet-hours <win>    Quiet window "HH:MM-HH:MM" (e.g. 23:00-08:00), may cross midnight;
                              outside it the job runs at its normal schedule
       --quiet-interval-mins <n>
-                             Wake-up interval in minutes during the quiet window
-                             (0 = off; requires --quiet-hours)
+                             Idle warm-up interval in minutes: when a precondition
+                             reports no change, run a muted cache-refresh ping once
+                             this interval has elapsed (0 = off). Inside a quiet-hours
+                             window it is also the warm-up spacing.
       --warm-prompt <text>   Prompt used during the quiet window
                              (default: "Reply OK only. Do not call any tools, read files,
                              or run commands.")
@@ -758,7 +760,9 @@ Editable Fields (bool: true/false):
 
 Editable Fields (int: number):
   timeout_mins        Max minutes per run (0 = no limit)
-  quiet_interval_mins  Wake-up interval in minutes during the quiet window (0 = off)
+  quiet_interval_mins  Idle warm-up interval in minutes: when a precondition reports no change,
+                        run a muted cache-refresh ping once this interval has elapsed (0 = off).
+                        Inside a quiet-hours window it is also the warm-up spacing.
   precondition_timeout  Timeout in seconds for the precondition command
                         (0 = default 10s; max 300)
 

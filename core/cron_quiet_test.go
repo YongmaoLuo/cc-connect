@@ -58,9 +58,10 @@ func TestCronQuietModel_Validate(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name:    "interval without quiet hours is rejected",
-			job:     CronJob{SessionKey: "feishu:1", QuietIntervalMins: 5},
-			wantErr: "quiet_hours is required when quiet_interval_mins > 0",
+			// Without a quiet-hours window the interval paces the idle
+			// warm-up, so it is a valid configuration on its own.
+			name: "interval without quiet hours is valid",
+			job:  CronJob{SessionKey: "feishu:1", QuietIntervalMins: 5},
 		},
 		{
 			name:    "negative interval is rejected",
@@ -269,10 +270,14 @@ func TestCronQuietModel_LegacyJSON(t *testing.T) {
 	}
 }
 
-// TestCronQuietUpdate_CombinedValidation covers the combination check in
+// TestCronQuietUpdate_CombinedValidation covers the quiet-hours checks in
 // CronScheduler.UpdateJob. The socket API (`handleCronEdit`) calls UpdateJob
-// directly, so without a combined check it could persist a job that
-// validateCronJob — and therefore /cron/add — would reject.
+// directly, so the checks here must not be laxer than the ones
+// validateCronJob — and therefore /cron/add — applies.
+//
+// The interval is no longer tied to the window: with one it paces the warm-up
+// pings inside the quiet window, without one it paces the idle warm-up. So
+// the window may be empty, and it may be cleared while an interval is set.
 func TestCronQuietUpdate_CombinedValidation(t *testing.T) {
 	store, err := NewCronStore(t.TempDir())
 	if err != nil {
@@ -297,20 +302,16 @@ func TestCronQuietUpdate_CombinedValidation(t *testing.T) {
 		}
 	}
 
-	// 1. An interval without a window is rejected, and nothing is
-	// half-written: the stored interval keeps its previous value.
-	t.Run("interval without quiet_hours is rejected", func(t *testing.T) {
+	// 1. An interval without a window is accepted: it paces the idle
+	// warm-up, so the pair is valid on its own.
+	t.Run("interval without quiet_hours is accepted", func(t *testing.T) {
 		newJob(t, "no-window", "", 0)
 
-		err := cs.UpdateJob("no-window", "quiet_interval_mins", 60)
-		if err == nil {
-			t.Fatal("UpdateJob(quiet_interval_mins=60) on a job without quiet_hours = nil, want error")
+		if err := cs.UpdateJob("no-window", "quiet_interval_mins", 60); err != nil {
+			t.Fatalf("UpdateJob(quiet_interval_mins=60) on a job without quiet_hours: %v", err)
 		}
-		if !strings.Contains(err.Error(), "quiet_hours is required when quiet_interval_mins > 0") {
-			t.Errorf("UpdateJob error = %q, want it to mention quiet_hours being required", err)
-		}
-		if got := store.Get("no-window").QuietIntervalMins; got != 0 {
-			t.Errorf("stored QuietIntervalMins = %d after rejected update, want 0", got)
+		if got := store.Get("no-window").QuietIntervalMins; got != 60 {
+			t.Errorf("stored QuietIntervalMins = %d, want 60", got)
 		}
 	})
 
@@ -326,23 +327,19 @@ func TestCronQuietUpdate_CombinedValidation(t *testing.T) {
 		}
 	})
 
-	// 3. Clearing the window while an interval is set would strand the
-	// interval, so it is rejected.
-	t.Run("clearing quiet_hours with an interval is rejected", func(t *testing.T) {
+	// 3. Clearing the window while an interval is set is allowed: the
+	// interval then paces the idle warm-up instead of the quiet window.
+	t.Run("clearing quiet_hours with an interval is accepted", func(t *testing.T) {
 		newJob(t, "has-interval", "00:00-08:00", 60)
 
-		err := cs.UpdateJob("has-interval", "quiet_hours", "")
-		if err == nil {
-			t.Fatal("UpdateJob(quiet_hours=\"\") on a job with an interval = nil, want error")
-		}
-		if !strings.Contains(err.Error(), "quiet_hours is required when quiet_interval_mins > 0") {
-			t.Errorf("UpdateJob error = %q, want it to mention quiet_hours being required", err)
+		if err := cs.UpdateJob("has-interval", "quiet_hours", ""); err != nil {
+			t.Fatalf("UpdateJob(quiet_hours=\"\") on a job with an interval: %v", err)
 		}
 		if got := store.Get("has-interval").QuietIntervalMins; got != 60 {
-			t.Errorf("stored QuietIntervalMins = %d after rejected update, want 60", got)
+			t.Errorf("stored QuietIntervalMins = %d, want 60", got)
 		}
-		if got := store.Get("has-interval").QuietHours; got != "00:00-08:00" {
-			t.Errorf("stored QuietHours = %q after rejected update, want %q", got, "00:00-08:00")
+		if got := store.Get("has-interval").QuietHours; got != "" {
+			t.Errorf("stored QuietHours = %q, want empty", got)
 		}
 	})
 
