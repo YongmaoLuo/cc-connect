@@ -172,6 +172,10 @@ interface JobForm {
   quiet_hours: string;
   quiet_interval_mins: string;
   warm_prompt: string;
+  // Precondition gating. The timeout is edited as free text so that an empty
+  // input is representable; on the wire it is a JSON number.
+  precondition: string;
+  precondition_timeout: string;
   _type: 'prompt' | 'exec';
 }
 
@@ -179,6 +183,7 @@ const emptyForm: JobForm = {
   project: '', session_key: '', cron_expr: '', prompt: '', exec: '',
   description: '', silent: false, enabled: true, mode: '',
   quiet_hours: '', quiet_interval_mins: '', warm_prompt: '',
+  precondition: '', precondition_timeout: '',
   _type: 'prompt',
 };
 
@@ -202,6 +207,18 @@ function quietConfig(form: JobForm): { hours: string; interval: number } {
   const hours = form.quiet_hours.trim();
   const interval = hours ? parseQuietInterval(form.quiet_interval_mins) : 0;
   return { hours, interval };
+}
+
+/* ── Precondition helpers ── */
+
+// parsePreconditionTimeout turns the free-text timeout field into the number
+// the API expects. An empty or invalid field means 0 (the server then applies
+// its own default), and the value is clamped to the 300 seconds the server
+// accepts — a larger one would be rejected outright.
+function parsePreconditionTimeout(raw: string): number {
+  const n = parseInt(raw.trim(), 10);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(n, 300);
 }
 
 /* ── Main page ── */
@@ -278,6 +295,8 @@ export default function CronList() {
       quiet_hours: job.quiet_hours || '',
       quiet_interval_mins: job.quiet_interval_mins ? String(job.quiet_interval_mins) : '',
       warm_prompt: job.warm_prompt || '',
+      precondition: job.precondition || '',
+      precondition_timeout: job.precondition_timeout ? String(job.precondition_timeout) : '',
       _type: job.exec ? 'exec' : 'prompt',
     });
     setShowForm(true);
@@ -291,6 +310,13 @@ export default function CronList() {
     try {
       if (isEdit && editJob) {
         const updates: Record<string, any> = {};
+        // The precondition command is patched first and its timeout second:
+        // the timeout only bounds the command it accompanies, so the command
+        // has to be applied before the timeout that belongs to it.
+        if (form.precondition !== (editJob.precondition || '')) updates.precondition = form.precondition;
+        const preconditionTimeout = parsePreconditionTimeout(form.precondition_timeout);
+        if (preconditionTimeout !== (editJob.precondition_timeout || 0))
+          updates.precondition_timeout = preconditionTimeout;
         // The quiet hours are patched first and the interval second: the
         // interval is only valid together with a window, so the window has
         // to be applied before the interval that belongs to it.
@@ -314,6 +340,9 @@ export default function CronList() {
         delete body._type;
         // The interval travels as a number, never as the raw text field.
         body.quiet_interval_mins = quiet.interval;
+        // Same for the precondition timeout: the server decodes it as a JSON
+        // number and rejects a string.
+        body.precondition_timeout = parsePreconditionTimeout(form.precondition_timeout);
         if (!body.prompt) delete body.prompt;
         if (!body.exec) delete body.exec;
         await createCronJob(body);
@@ -425,6 +454,21 @@ export default function CronList() {
                   <div className="flex items-center gap-1.5">
                     <span className="font-medium w-12 shrink-0 text-gray-400">{t('cron.exec')}</span>
                     <code className="truncate text-[11px]">{job.exec}</code>
+                  </div>
+                )}
+                {/* Precondition: the shell command that gates the job. An empty
+                    command renders no row at all, and a missing (undefined)
+                    timeout renders none either — never a literal "undefined". */}
+                {job.precondition && (
+                  <div className="flex items-start gap-2">
+                    <span className="font-medium w-24 shrink-0 text-gray-400">{t('cron.precondition')}</span>
+                    <code className="truncate text-[11px]">{job.precondition}</code>
+                  </div>
+                )}
+                {job.precondition && job.precondition_timeout > 0 && (
+                  <div className="flex items-start gap-2">
+                    <span className="font-medium w-24 shrink-0 text-gray-400">{t('cron.preconditionTimeout')}</span>
+                    <span>{job.precondition_timeout}</span>
                   </div>
                 )}
                 {job.quiet_hours && (
@@ -617,6 +661,26 @@ export default function CronList() {
             value={form.warm_prompt}
             onChange={e => setForm({ ...form, warm_prompt: e.target.value })}
             placeholder={t('cron.warmPromptPlaceholder')}
+          />
+
+          {/* Precondition: a shell command that must exit 0 for the job to run */}
+          <Textarea
+            label={t('cron.precondition', { defaultValue: 'Precondition' })}
+            value={form.precondition}
+            onChange={e => setForm({ ...form, precondition: e.target.value })}
+            rows={2}
+            placeholder={t('cron.preconditionPlaceholder')}
+            className="font-mono text-xs"
+          />
+
+          <Input
+            label={t('cron.preconditionTimeout', { defaultValue: 'Precondition timeout (s)' })}
+            type="number"
+            min={0}
+            max={300}
+            value={form.precondition_timeout}
+            onChange={e => setForm({ ...form, precondition_timeout: e.target.value })}
+            placeholder="0"
           />
 
           <div className="flex items-center gap-6 pt-1">

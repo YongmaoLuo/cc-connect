@@ -881,6 +881,8 @@ Lists all cron jobs, optionally filtered by project.
         "quiet_hours": "23:00-08:00",
         "quiet_interval_mins": 60,
         "warm_prompt": "Reply OK only.",
+        "precondition": "test -f /tmp/state.md",
+        "precondition_timeout": 30,
         "created_at": "2026-03-10T08:00:00Z",
         "last_run": "2026-03-10T06:00:00Z",
         "last_error": ""
@@ -890,8 +892,9 @@ Lists all cron jobs, optionally filtered by project.
 }
 ```
 
-The `quiet_hours`, `quiet_interval_mins` and `warm_prompt` fields are omitted
-from the response when they are not set.
+The `quiet_hours`, `quiet_interval_mins`, `warm_prompt`, `precondition` and
+`precondition_timeout` fields are omitted from the response when they are not
+set.
 
 ---
 
@@ -926,6 +929,20 @@ Adds a cron job. Either `prompt` or `exec` must be provided, not both.
 }
 ```
 
+**Request body (job with a precondition):**
+
+```json
+{
+  "project": "my-backend",
+  "session_key": "telegram:123:456",
+  "cron_expr": "*/20 * * * *",
+  "prompt": "Summarize GitHub trending",
+  "description": "Trending, only when there is something new",
+  "precondition": "test \"$(stat -f %m /tmp/state.md)\" -gt \"$CC_CRON_LAST_RUN\"",
+  "precondition_timeout": 30
+}
+```
+
 | Field        | Type    | Required | Description                                    |
 |--------------|---------|----------|------------------------------------------------|
 | `project`    | string  | no*      | Project name (*required if multiple projects) |
@@ -941,6 +958,8 @@ Adds a cron job. Either `prompt` or `exec` must be provided, not both.
 | `quiet_hours` | string  | no       | Daily quiet-hours window `HH:MM-HH:MM`; omit = disabled |
 | `quiet_interval_mins` | int | no      | Wake-up interval inside the quiet window; requires `quiet_hours` |
 | `warm_prompt` | string  | no       | Prompt used during quiet hours (default: reply OK only) |
+| `precondition` | string | no       | Shell command gating the run; omit = no gate. At most 4096 bytes. |
+| `precondition_timeout` | int | no      | Timeout in seconds for the precondition command: omit or `0` = 10s; otherwise 1–300. |
 
 **Quiet hours:** when `quiet_hours` is set, a job that comes due inside the
 window does not run normally. It is skipped and — when `quiet_interval_mins`
@@ -948,6 +967,67 @@ is set — woken up at most that often with the warm prompt, muted, so nothing
 is written to the chat. Shell jobs (`exec`) and jobs with
 `session_mode: new_per_run` are always skipped inside the window. Outside the
 window the job runs exactly as before.
+
+**Preconditions:** when `precondition` is set, the command runs before the
+job's own work and decides whether the job runs at all. It is a gate in front
+of the job, not a replacement for it: once the gate lets the job through, the
+job runs exactly as before. A job without a precondition is never gated.
+
+The gate is evaluated when the job is about to run on its schedule. A job
+skipped by quiet hours — and a quiet-hours warm-up run — never reaches it. A
+manual trigger never reaches it either: `POST /api/v1/cron/{id}/exec` and the
+`cc-connect cron exec` CLI run the job straight away, so a precondition can
+never turn a manual run into a skipped one.
+
+**Exit codes:**
+
+| Exit | Effect |
+|------|--------|
+| `0` | The gate passes: the job runs. |
+| `1`–`125` | The gate blocks: the job is skipped. It does not run, and its `last_run` is not updated, so the next run still sees the previous timestamp. Its schedule is still advanced, so the scheduler does not spin on it. |
+| `126`, `127`, or any code above `125` | The command could not be executed (not executable / not found) or ended unexpectedly: the gate **fails open** — the job runs. |
+| Killed by a signal, including by the timeout | The gate **fails open** — the job runs. |
+| The command could not be started at all | The gate **fails open** — the job runs. |
+
+Failing open is deliberate: a typo or a missing binary in the command must
+not silently stop a job forever. Every fail-open is logged as a warning.
+
+**Environment:** the command is given the variables below. They are the only
+channel through which it learns which job it guards and when that job last
+ran.
+
+| Variable | Value |
+|----------|-------|
+| `CC_CRON_JOB_ID` | The job's ID. |
+| `CC_CRON_JOB_DESC` | The job's description (may be empty). |
+| `CC_CRON_PROJECT` | The job's project name. |
+| `CC_CRON_SESSION_KEY` | The job's target session key. |
+| `CC_CRON_LAST_RUN` | Unix timestamp of the job's last run; `0` when the job has never run. |
+| `CC_CRON_NOW` | Unix timestamp of the current time. |
+
+The values are passed as environment variables, not substituted into the
+command text, so quote them in the command (`"$CC_CRON_LAST_RUN"`). A job
+that has never run reports `CC_CRON_LAST_RUN=0` rather than an empty value,
+so a condition can branch on it without first testing for emptiness.
+
+The command runs with the job's `work_dir` as its working directory when the
+job has one, and with the daemon's working directory otherwise.
+
+**Output:** the command's combined output is captured, truncated to 4 KB and
+written to the log only. It never reaches a chat message and is never stored
+on the job.
+
+**Security:** a precondition is a shell command an administrator configures.
+It runs with the privileges of the daemon user and sits at the same trust
+level as an `exec` job — anyone who can create a cron job can already run
+arbitrary shell commands through one. The daemon does not interpolate any
+external input into the command; the values it sees arrive as environment
+variables, and quoting them is the command author's job. A precondition is a
+**cost gate, not a security control**: use it to avoid paying for a run that
+has nothing to do, not to keep untrusted callers out. The management API
+accepts unauthenticated requests when no token is configured, but that surface
+already allows creating `exec` jobs, so the gate does not widen the attack
+surface.
 
 **Response:**
 
@@ -979,7 +1059,9 @@ Updates a cron job. Only the provided fields are updated.
 {
   "quiet_hours": "23:00-08:00",
   "quiet_interval_mins": 60,
-  "warm_prompt": "Reply OK only."
+  "warm_prompt": "Reply OK only.",
+  "precondition": "test -f /tmp/state.md",
+  "precondition_timeout": 30
 }
 ```
 
@@ -988,6 +1070,8 @@ Updates a cron job. Only the provided fields are updated.
 | `quiet_hours`        | string | Daily quiet-hours window `HH:MM-HH:MM`; omit = disabled. A window whose start is later than its end (`23:00-08:00`) spans midnight. |
 | `quiet_interval_mins`| int    | Wake-up interval used inside the quiet window. Requires `quiet_hours`; `0` = the job is simply held back until the window closes. |
 | `warm_prompt`        | string | Prompt sent to the agent during quiet hours. Default: `Reply OK only. Do not call any tools, read files, or run commands.` |
+| `precondition`       | string | Shell command gating the run; omit or `""` = no gate. At most 4096 bytes. |
+| `precondition_timeout`| int   | Timeout in seconds for the precondition command: `0` = 10s; otherwise 1–300. |
 
 The other updatable fields are `project`, `session_key`, `cron_expr`,
 `prompt`, `exec`, `work_dir`, `description`, `enabled`, `silent`, `mute`,
@@ -997,7 +1081,8 @@ The other updatable fields are `project`, `session_key`, `cron_expr`,
 `quiet_hours` and `quiet_interval_mins` are only valid together: a request
 that would leave the job with an interval but no window is rejected with
 `400`. The fields are applied in a fixed order, so the result does not depend
-on the order of the JSON object.
+on the order of the JSON object: the precondition command is applied before
+the timeout that bounds it.
 
 **Response:**
 
@@ -1015,6 +1100,8 @@ on the order of the JSON object.
     "quiet_hours": "23:00-08:00",
     "quiet_interval_mins": 60,
     "warm_prompt": "Reply OK only.",
+    "precondition": "test -f /tmp/state.md",
+    "precondition_timeout": 30,
     "created_at": "2026-03-10T10:40:00Z"
   }
 }

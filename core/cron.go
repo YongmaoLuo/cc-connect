@@ -49,6 +49,12 @@ type CronJob struct {
 	// WarmPrompt is the prompt sent to the agent during quiet hours.
 	// Empty = use DefaultWarmPrompt.
 	WarmPrompt string `json:"warm_prompt,omitempty"`
+	// Precondition is a shell command guarding the job. Empty = no gate: the
+	// job runs on every fire.
+	Precondition string `json:"precondition,omitempty"`
+	// PreconditionTimeout bounds the precondition command in seconds.
+	// 0 = fall back to the default at execution time.
+	PreconditionTimeout int `json:"precondition_timeout,omitempty"`
 }
 
 // DefaultWarmPrompt is the prompt used to warm a job up during quiet hours:
@@ -274,6 +280,12 @@ func validateCronJob(j *CronJob) error {
 		if _, _, _, err := ParseQuietHours(j.QuietHours); err != nil {
 			return err
 		}
+	}
+	if j.PreconditionTimeout < 0 || j.PreconditionTimeout > 300 {
+		return fmt.Errorf("precondition_timeout must be between 0 and 300 seconds")
+	}
+	if len(j.Precondition) > 4096 {
+		return fmt.Errorf("precondition must be at most 4096 bytes")
 	}
 	return nil
 }
@@ -559,6 +571,20 @@ func updateJobField(job *CronJob, field string, value any) error {
 			job.WarmPrompt = v
 			return nil
 		}
+	case "precondition":
+		if v, ok := value.(string); ok {
+			job.Precondition = v
+			return nil
+		}
+	case "precondition_timeout":
+		if v, ok := value.(float64); ok {
+			job.PreconditionTimeout = int(v)
+			return nil
+		}
+		if v, ok := value.(int); ok {
+			job.PreconditionTimeout = v
+			return nil
+		}
 	}
 	// Fallback: try to set string field via reflection
 	if v, ok := value.(string); ok {
@@ -821,13 +847,32 @@ func (cs *CronScheduler) fireDueJobs() {
 		if job != nil {
 			switch job.quietActionAt(now) {
 			case quietSkip:
+				// A skipped tick is side-effect free: it must not run the
+				// precondition either, so nothing the guard would touch
+				// happens while the job is held back.
 				// Skipped jobs still have their schedule advanced below, so
 				// the scheduler does not spin on them.
 				slog.Info("cron: job skipped during quiet hours", "id", job.ID, "project", job.Project)
 			case quietWarm:
+				// The warm-up ping takes priority over the precondition: the
+				// condition guards the real work, not the keep-alive, so a
+				// failing condition must not silence the warm run.
 				slog.Info("cron: warm-up run during quiet hours", "id", job.ID, "project", job.Project)
 				cs.runJob(job.warmSnapshot(), false)
 			default:
+				// A job may guard itself with a precondition command. When
+				// the command blocks, the job is skipped: it does not run and
+				// its LastRun is left alone, but its nextRun is still advanced
+				// below so the scheduler does not spin on it.
+				if strings.TrimSpace(job.Precondition) != "" {
+					allow, code, out := runPrecondition(job, now)
+					if !allow {
+						slog.Info("cron: precondition skipped job",
+							"id", job.ID, "project", job.Project, "exit", code,
+							"output", truncatePreconditionOutput(out))
+						break
+					}
+				}
 				cs.runJob(job, false)
 			}
 		}
@@ -998,6 +1043,34 @@ func (cs *CronScheduler) UpdateJob(id string, field string, value any) error {
 	if field == "enabled" {
 		if _, ok := value.(bool); !ok {
 			return fmt.Errorf("enabled must be a boolean")
+		}
+	}
+
+	// Validate the precondition fields up-front, for the same reason as
+	// "enabled" above: a bad value must not reach the persisted job. The
+	// bounds match validateCronJob, so `cron edit` cannot leave behind a job
+	// that /cron/add would have refused.
+	switch field {
+	case "precondition":
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("precondition must be a string")
+		}
+		if len(v) > 4096 {
+			return fmt.Errorf("precondition must be at most 4096 bytes")
+		}
+	case "precondition_timeout":
+		var n int
+		switch v := value.(type) {
+		case float64:
+			n = int(v)
+		case int:
+			n = v
+		default:
+			return fmt.Errorf("precondition_timeout must be a number")
+		}
+		if n < 0 || n > 300 {
+			return fmt.Errorf("precondition_timeout must be between 0 and 300 seconds")
 		}
 	}
 

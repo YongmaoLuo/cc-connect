@@ -335,6 +335,13 @@ type CronAddRequest struct {
 	QuietHours        string `json:"quiet_hours,omitempty"`
 	QuietIntervalMins int    `json:"quiet_interval_mins,omitempty"`
 	WarmPrompt        string `json:"warm_prompt,omitempty"`
+
+	// Precondition is a shell command gating the job: it must exit 0 for the
+	// job to run. Empty = no gate, the job runs on every fire.
+	// PreconditionTimeout bounds that command in seconds; 0 = use the
+	// default at execution time.
+	Precondition        string `json:"precondition,omitempty"`
+	PreconditionTimeout int    `json:"precondition_timeout,omitempty"`
 }
 
 func (s *APIServer) handleCronAdd(w http.ResponseWriter, r *http.Request) {
@@ -420,6 +427,11 @@ func (s *APIServer) handleCronAdd(w http.ResponseWriter, r *http.Request) {
 		QuietHours:        req.QuietHours,
 		QuietIntervalMins: req.QuietIntervalMins,
 		WarmPrompt:        req.WarmPrompt,
+		// Precondition gate. AddJob validates it, so an out-of-range
+		// timeout or an over-long command is reported as a 400 with the
+		// reason and nothing is persisted.
+		Precondition:        req.Precondition,
+		PreconditionTimeout: req.PreconditionTimeout,
 	}
 	job.CreatedAt = time.Now()
 

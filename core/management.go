@@ -1763,6 +1763,11 @@ func (m *ManagementServer) handleCron(w http.ResponseWriter, r *http.Request) {
 			QuietHours:        req.QuietHours,
 			QuietIntervalMins: req.QuietIntervalMins,
 			WarmPrompt:        req.WarmPrompt,
+			// Precondition gate. AddJob validates it, so an over-long
+			// command or an out-of-range timeout is reported as a 400
+			// with the reason.
+			Precondition:        req.Precondition,
+			PreconditionTimeout: req.PreconditionTimeout,
 		}
 		if err := m.cronScheduler.AddJob(job); err != nil {
 			mgmtError(w, http.StatusBadRequest, err.Error())
@@ -1870,14 +1875,17 @@ func (m *ManagementServer) handleCronByID(w http.ResponseWriter, r *http.Request
 //
 // Go randomizes map iteration, so applying the fields in map order would make
 // a multi-field PATCH behave differently from one request to the next. The
-// quiet-hours window comes first because the quiet interval is only valid
-// together with a window; the remaining fields follow in a stable
-// alphabetical order.
+// precondition command comes first because its timeout only bounds the
+// command it accompanies; the quiet-hours window follows for the same reason
+// (the quiet interval is only valid together with a window). The remaining
+// fields follow in a stable alphabetical order.
 func cronPatchOrder(updates map[string]any) []string {
 	priority := map[string]int{
-		"quiet_hours":         0,
-		"quiet_interval_mins": 1,
-		"warm_prompt":         2,
+		"precondition":         0,
+		"quiet_hours":          1,
+		"precondition_timeout": 2,
+		"quiet_interval_mins":  3,
+		"warm_prompt":          4,
 	}
 	fields := make([]string, 0, len(updates))
 	for field := range updates {
