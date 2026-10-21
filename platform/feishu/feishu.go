@@ -137,16 +137,19 @@ type Platform struct {
 	groupChatHistoryShare      bool
 	// noReplyToTrigger: when true, send via Create instead of Im.Message.Reply (no quote to the user's message).
 	noReplyToTrigger bool
-	resolveMentions  bool
-	client           *lark.Client
-	replayClient     *lark.Client
-	replayClientMu   sync.Mutex
-	wsClient         *larkws.Client
-	handler          core.MessageHandler
-	cardNavHandler   core.CardNavigationHandler
-	cancel           context.CancelFunc
-	dedup            *core.MessageDedup
-	botOpenID        string
+	// threadBootstrapQuote: when false, the first message in a thread does not
+	// pull the parent/root reply chain into the agent context. Default true.
+	threadBootstrapQuote bool
+	resolveMentions      bool
+	client               *lark.Client
+	replayClient         *lark.Client
+	replayClientMu       sync.Mutex
+	wsClient             *larkws.Client
+	handler              core.MessageHandler
+	cardNavHandler       core.CardNavigationHandler
+	cancel               context.CancelFunc
+	dedup                *core.MessageDedup
+	botOpenID            string
 	// groupFilterDegraded is true when bot open_id discovery failed at startup
 	// (e.g. transient network/DNS/proxy outage). When true, group chat mention
 	// filtering fails closed (silently drops group messages without @bot) instead
@@ -381,6 +384,10 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	if v, ok := opts["reply_to_trigger"].(bool); ok && !v {
 		noReplyToTrigger = true
 	}
+	threadBootstrapQuote := true
+	if v, ok := opts["thread_bootstrap_quote"].(bool); ok {
+		threadBootstrapQuote = v
+	}
 
 	peerBots := map[string]string{}
 	if raw, ok := opts["peer_bots"].(map[string]any); ok {
@@ -492,6 +499,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		groupChatHistoryShare:      groupChatHistoryShare,
 		resolveMentions:            resolveMentionsOpt,
 		noReplyToTrigger:           noReplyToTrigger,
+		threadBootstrapQuote:       threadBootstrapQuote,
 		client:                     lark.NewClient(appID, appSecret, clientOpts...),
 		replayClient:               newFeishuReplayClient(appID, appSecret, domain),
 		dedup:                      &core.MessageDedup{},
@@ -1928,8 +1936,11 @@ func (p *Platform) dispatchMessageWithHistory(ctx context.Context, msgType, cont
 	// (issue #764). The first accepted message in a pre-existing thread is the
 	// exception: earlier unmentioned messages were never dispatched to the
 	// agent, so bootstrap its context from the parent/root reply chain once.
+	// Operators who prefer that the first message stand on its own can turn
+	// the bootstrap off with thread_bootstrap_quote = false; the other two
+	// branches (thread_isolation off, non-thread session) are unaffected.
 	var quoted quotedMessage
-	if parentID != "" && (!p.threadIsolation || !isThreadSessionKey(sessionKey) || rctx.bootstrapThread) {
+	if parentID != "" && (!p.threadIsolation || !isThreadSessionKey(sessionKey) || (rctx.bootstrapThread && p.threadBootstrapQuote)) {
 		quoted = p.fetchQuotedMessage(ctx, parentID)
 	}
 	historyText := p.formatGroupHistory(groupHistoryCtx)
