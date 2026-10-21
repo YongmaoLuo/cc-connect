@@ -956,17 +956,23 @@ Adds a cron job. Either `prompt` or `exec` must be provided, not both.
 | `session_mode` | string | no       | `reuse` (default) or `new_per_run` — new agent session each run |
 | `timeout_mins` | int    | no       | Scheduler wait per run: omit = 30 min, `0` = no time limit |
 | `quiet_hours` | string  | no       | Daily quiet-hours window `HH:MM-HH:MM`; omit = disabled |
-| `quiet_interval_mins` | int | no      | Wake-up interval inside the quiet window; requires `quiet_hours` |
-| `warm_prompt` | string  | no       | Prompt used during quiet hours (default: reply OK only) |
+| `quiet_interval_mins` | int | no      | Rate-limit interval inside the quiet window; requires `quiet_hours` |
+| `warm_prompt` | string  | no       | Prompt used for the quiet-hours warm-up ping (default: reply OK only) |
 | `precondition` | string | no       | Shell command gating the run; omit = no gate. At most 4096 bytes. |
 | `precondition_timeout` | int | no      | Timeout in seconds for the precondition command: omit or `0` = 10s; otherwise 1–300. |
 
 **Quiet hours:** when `quiet_hours` is set, a job that comes due inside the
-window does not run normally. It is skipped and — when `quiet_interval_mins`
-is set — woken up at most that often with the warm prompt, muted, so nothing
-is written to the chat. Shell jobs (`exec`) and jobs with
-`session_mode: new_per_run` are always skipped inside the window. Outside the
-window the job runs exactly as before.
+window is rate-limited to at most one run per `quiet_interval_mins` instead of
+running on every tick. Ticks that come due before the interval has elapsed run
+nothing at all — not even the precondition. The first tick past the interval
+goes through the normal decision: if there is a `precondition` and it reports
+an update (exit `0`), or there is no precondition at all, the job runs for
+real; when the precondition reports no change the job is replaced by a muted
+warm-up ping (`warm_prompt`) that writes nothing to the chat. Shell jobs
+(`exec`) and jobs with `session_mode: new_per_run` are rate-limited the same
+way. Setting `quiet_interval_mins` to `0` disables the rate limit and holds
+the job back for the whole window instead. Outside the window the job runs
+exactly as before.
 
 **Preconditions:** when `precondition` is set, the command runs before the
 job's own work and decides whether the job runs at all. It is a gate in front
@@ -1067,9 +1073,9 @@ Updates a cron job. Only the provided fields are updated.
 
 | Field                | Type   | Description |
 |----------------------|--------|-------------|
-| `quiet_hours`        | string | Daily quiet-hours window `HH:MM-HH:MM`; omit = disabled. A window whose start is later than its end (`23:00-08:00`) spans midnight. |
-| `quiet_interval_mins`| int    | Wake-up interval used inside the quiet window. Requires `quiet_hours`; `0` = the job is simply held back until the window closes. |
-| `warm_prompt`        | string | Prompt sent to the agent during quiet hours. Default: `Reply OK only. Do not call any tools, read files, or run commands.` |
+| `quiet_hours`        | string | Daily quiet-hours window `HH:MM-HH:MM`; omit = disabled. A window whose start is later than its end (`23:00-08:00`) spans midnight. Inside it the job is rate-limited to one run per `quiet_interval_mins`. |
+| `quiet_interval_mins`| int    | Rate limit used inside the quiet window: at most one run per this many minutes, the first tick past the interval going through the normal precondition decision. Requires `quiet_hours`; `0` = no rate limit, the job is held back until the window closes. |
+| `warm_prompt`        | string | Prompt sent to the agent for the quiet-hours warm-up ping, used when the precondition reports no change. Default: `Reply OK only. Do not call any tools, read files, or run commands.` |
 | `precondition`       | string | Shell command gating the run; omit or `""` = no gate. At most 4096 bytes. |
 | `precondition_timeout`| int   | Timeout in seconds for the precondition command: `0` = 10s; otherwise 1–300. |
 

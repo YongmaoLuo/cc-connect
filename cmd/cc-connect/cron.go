@@ -693,13 +693,16 @@ Options:
       --session-mode <mode>  reuse (default) or new-per-run — fresh agent session each run
       --timeout-mins <n>     Max minutes to wait per run (0 = no limit; default 30 if omitted)
       --quiet-hours <win>    Quiet window "HH:MM-HH:MM" (e.g. 23:00-08:00), may cross midnight;
+                             inside it the job is rate-limited to --quiet-interval-mins,
                              outside it the job runs at its normal schedule
       --quiet-interval-mins <n>
-                             Idle warm-up interval in minutes: when a precondition
-                             reports no change, run a muted cache-refresh ping once
-                             this interval has elapsed (0 = off). Inside a quiet-hours
-                             window it is also the warm-up spacing.
-      --warm-prompt <text>   Prompt used during the quiet window
+                             Rate limit in minutes inside the quiet window: at most one run
+                             per interval, ticks in between run nothing at all (0 = no rate
+                             limit, the job is held back until the window closes). Outside a
+                             quiet-hours window it paces the idle warm-up instead: when a
+                             precondition reports no change, run a muted cache-refresh ping
+                             once this interval has elapsed.
+      --warm-prompt <text>   Prompt used for the quiet-hours warm-up ping
                              (default: "Reply OK only. Do not call any tools, read files,
                              or run commands.")
       --precondition <cmd>   Shell command gating the run: exit 0 runs the job,
@@ -748,8 +751,9 @@ Editable Fields (string):
   work_dir      Working directory for exec
   description   Short description
   session_mode  reuse or new_per_run
-  quiet_hours   Quiet window "HH:MM-HH:MM", e.g. "23:00-08:00" (may cross midnight)
-  warm_prompt   Prompt used during the quiet window (empty = built-in default)
+  quiet_hours   Quiet window "HH:MM-HH:MM", e.g. "23:00-08:00" (may cross midnight);
+                inside it the job is rate-limited to one run per quiet_interval_mins
+  warm_prompt   Prompt used for the quiet-hours warm-up ping (empty = built-in default)
   precondition  Shell command gating the run: exit 0 runs the job,
                 exit 1-125 skips it (any other exit code fails open)
 
@@ -760,9 +764,11 @@ Editable Fields (bool: true/false):
 
 Editable Fields (int: number):
   timeout_mins        Max minutes per run (0 = no limit)
-  quiet_interval_mins  Idle warm-up interval in minutes: when a precondition reports no change,
-                        run a muted cache-refresh ping once this interval has elapsed (0 = off).
-                        Inside a quiet-hours window it is also the warm-up spacing.
+  quiet_interval_mins  Rate limit in minutes inside the quiet window: at most one run per
+                        interval, ticks in between run nothing at all (0 = no rate limit,
+                        the job is held back until the window closes). Outside a quiet-hours
+                        window it paces the idle warm-up: when a precondition reports no
+                        change, run a muted cache-refresh ping once this interval elapsed.
   precondition_timeout  Timeout in seconds for the precondition command
                         (0 = default 10s; max 300)
 
