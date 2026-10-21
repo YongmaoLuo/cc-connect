@@ -151,7 +151,10 @@
     "quietHours": "静默时段",
     "quietInterval": "静默间隔（分钟）",
     "warmPrompt": "静默唤醒提示词",
-    "warmPromptPlaceholder": "静默时段使用的提示词（留空使用默认）"
+    "warmPromptPlaceholder": "静默时段使用的提示词（留空使用默认）",
+    "precondition": "前置条件",
+    "preconditionTimeout": "前置条件超时（秒）",
+    "preconditionPlaceholder": "shell 命令；exit 0 执行，1-125 跳过"
   },
   "heartbeat": {
     "title": "心跳",

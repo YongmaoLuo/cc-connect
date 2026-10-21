@@ -20,6 +20,10 @@ export interface CronJob {
   quiet_hours: string;
   quiet_interval_mins: number;
   warm_prompt: string;
+  // Precondition gating. The server omits them when unset, so they can be
+  // undefined at runtime even though the type says otherwise.
+  precondition: string;
+  precondition_timeout: number;
   created_at: string;
   last_run: string;
   last_error: string;

@@ -59,7 +59,8 @@ func closeCronResponseBody(body io.Closer) {
 func runCronAdd(args []string) {
 	var project, sessionKey, cronExpr, prompt, execCmd, desc, dataDir, sessionMode string
 	var quietHours, warmPrompt string
-	var timeoutMins, quietIntervalMins *int
+	var precondition string
+	var timeoutMins, quietIntervalMins, preconditionTimeout *int
 	var silent bool
 
 	var positional []string
@@ -135,6 +136,21 @@ func runCronAdd(args []string) {
 				i++
 				warmPrompt = args[i]
 			}
+		case "--precondition":
+			if i+1 < len(args) {
+				i++
+				precondition = args[i]
+			}
+		case "--precondition-timeout":
+			if i+1 < len(args) {
+				i++
+				n, err := strconv.Atoi(args[i])
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error: invalid --precondition-timeout: %v\n", err)
+					os.Exit(1)
+				}
+				preconditionTimeout = &n
+			}
 		case "--silent":
 			silent = true
 		case "--help", "-h":
@@ -207,6 +223,15 @@ func runCronAdd(args []string) {
 	}
 	if warmPrompt != "" {
 		body["warm_prompt"] = warmPrompt
+	}
+	// The precondition keys are omitted rather than sent as zero values: a job
+	// created without the flags must stay byte-identical to one created by an
+	// older CLI, so old daemons and old jobs.json keep working.
+	if precondition != "" {
+		body["precondition"] = precondition
+	}
+	if preconditionTimeout != nil {
+		body["precondition_timeout"] = *preconditionTimeout
 	}
 	payload, _ := json.Marshal(body)
 
@@ -599,7 +624,12 @@ func runCronEdit(args []string) {
 // `silent` was previously missing from the bool case here even though it's
 // documented as a bool in printCronEditUsage, so `cc-connect cron edit <id>
 // silent true` failed with "unknown or invalid field: silent" — see the
-// regression test in cron_edit_test.go.
+// regression test in cron_edit_test.go. precondition_timeout had the same
+// shape of bug: sent as a string it fell through to the reflection path,
+// which cannot set an int field. precondition needs no case of its own —
+// it is a string and must reach the daemon byte-for-byte, since a shell
+// runs it there — but it is listed in the default branch's comment so a
+// future reader does not "fix" it into a case that trims.
 func parseCronEditValue(field, valueStr string) (any, error) {
 	switch field {
 	case "enabled", "mute", "silent":
@@ -608,7 +638,7 @@ func parseCronEditValue(field, valueStr string) (any, error) {
 			return nil, fmt.Errorf("%s must be true or false", field)
 		}
 		return v, nil
-	case "timeout_mins", "quiet_interval_mins":
+	case "timeout_mins", "quiet_interval_mins", "precondition_timeout":
 		v, err := strconv.Atoi(valueStr)
 		if err != nil {
 			return nil, fmt.Errorf("%s must be an integer", field)
@@ -617,7 +647,7 @@ func parseCronEditValue(field, valueStr string) (any, error) {
 	default:
 		// String fields: project, session_key, cron_expr, prompt, exec,
 		// work_dir, description, session_mode, mode, quiet_hours,
-		// warm_prompt
+		// warm_prompt, precondition
 		return valueStr, nil
 	}
 }
@@ -670,6 +700,11 @@ Options:
       --warm-prompt <text>   Prompt used during the quiet window
                              (default: "Reply OK only. Do not call any tools, read files,
                              or run commands.")
+      --precondition <cmd>   Shell command gating the run: exit 0 runs the job,
+                             exit 1-125 skips it (any other exit code fails open)
+      --precondition-timeout <n>
+                             Timeout in seconds for the precondition command
+                             (0 = default 10s; max 300)
       --silent               Suppress cron start notification
       --data-dir <path>      Data directory (default: ~/.cc-connect)
   -h, --help                 Show this help
@@ -679,6 +714,7 @@ Examples:
   cc-connect cron add --cron "*/30 * * * *" --exec "df -h" --desc "Disk usage check"
   cc-connect cron add --cron "0 9 * * *" --prompt "Daily standup reminder" --silent
   cc-connect cron add --cron "*/20 * * * *" --prompt "监控" --quiet-hours 23:00-08:00 --quiet-interval-mins 60
+  cc-connect cron add --cron "*/20 * * * *" --prompt "监控" --precondition 'test "$(stat -f %m /tmp/state.md)" -gt "$CC_CRON_LAST_RUN"'
   cc-connect cron add 0 6 * * * Collect GitHub trending data and send me a summary`)
 }
 
@@ -712,6 +748,8 @@ Editable Fields (string):
   session_mode  reuse or new_per_run
   quiet_hours   Quiet window "HH:MM-HH:MM", e.g. "23:00-08:00" (may cross midnight)
   warm_prompt   Prompt used during the quiet window (empty = built-in default)
+  precondition  Shell command gating the run: exit 0 runs the job,
+                exit 1-125 skips it (any other exit code fails open)
 
 Editable Fields (bool: true/false):
   enabled       Enable or disable the task
@@ -721,6 +759,8 @@ Editable Fields (bool: true/false):
 Editable Fields (int: number):
   timeout_mins        Max minutes per run (0 = no limit)
   quiet_interval_mins  Wake-up interval in minutes during the quiet window (0 = off)
+  precondition_timeout  Timeout in seconds for the precondition command
+                        (0 = default 10s; max 300)
 
 Read-only Fields (cannot be edited):
   id, created_at, last_run, last_error
@@ -736,5 +776,7 @@ Examples:
   cc-connect cron edit abc123 timeout_mins 60
   cc-connect cron edit abc123 mute true
   cc-connect cron edit abc123 quiet_hours "23:00-08:00"
-  cc-connect cron edit abc123 quiet_interval_mins 60`)
+  cc-connect cron edit abc123 quiet_interval_mins 60
+  cc-connect cron edit abc123 precondition 'test "$(stat -f %m /tmp/state.md)" -gt "$CC_CRON_LAST_RUN"'
+  cc-connect cron edit abc123 precondition_timeout 30`)
 }
