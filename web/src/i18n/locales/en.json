@@ -151,7 +151,10 @@
     "quietHours": "Quiet hours",
     "quietInterval": "Quiet interval (min)",
     "warmPrompt": "Warm-up prompt",
-    "warmPromptPlaceholder": "Prompt used during quiet hours (empty = default)"
+    "warmPromptPlaceholder": "Prompt used during quiet hours (empty = default)",
+    "precondition": "Precondition",
+    "preconditionTimeout": "Precondition timeout (sec)",
+    "preconditionPlaceholder": "Shell command; exit 0 runs the job, 1-125 skips it"
   },
   "heartbeat": {
     "title": "Heartbeat",
