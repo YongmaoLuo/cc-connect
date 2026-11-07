@@ -35,7 +35,8 @@ import (
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 )
 
-// sanitizingLogger wraps a logger and masks sensitive URL parameters.
+// sanitizingLogger masks sensitive URL parameters and respects the application log level.
+// The WebSocket SDK does not apply WithLogLevel to a custom logger.
 type sanitizingLogger struct {
 	inner larkcore.Logger
 }
@@ -71,7 +72,11 @@ func (l *sanitizingLogger) sanitize(s string) string {
 	return s
 }
 
+// Debug forwards sanitized SDK messages only when the application enables this level.
 func (l *sanitizingLogger) Debug(ctx context.Context, args ...interface{}) {
+	if !slog.Default().Enabled(ctx, slog.LevelDebug) {
+		return
+	}
 	for _, arg := range args {
 		s, ok := arg.(string)
 		if !ok {
@@ -85,15 +90,27 @@ func (l *sanitizingLogger) Debug(ctx context.Context, args ...interface{}) {
 	l.inner.Debug(ctx, l.maskURL(args...)...)
 }
 
+// Info forwards sanitized SDK messages only when the application enables this level.
 func (l *sanitizingLogger) Info(ctx context.Context, args ...interface{}) {
+	if !slog.Default().Enabled(ctx, slog.LevelInfo) {
+		return
+	}
 	l.inner.Info(ctx, l.maskURL(args...)...)
 }
 
+// Warn forwards sanitized SDK messages only when the application enables this level.
 func (l *sanitizingLogger) Warn(ctx context.Context, args ...interface{}) {
+	if !slog.Default().Enabled(ctx, slog.LevelWarn) {
+		return
+	}
 	l.inner.Warn(ctx, l.maskURL(args...)...)
 }
 
+// Error forwards sanitized SDK messages only when the application enables this level.
 func (l *sanitizingLogger) Error(ctx context.Context, args ...interface{}) {
+	if !slog.Default().Enabled(ctx, slog.LevelError) {
+		return
+	}
 	l.inner.Error(ctx, l.maskURL(args...)...)
 }
 
@@ -123,6 +140,7 @@ type Platform struct {
 	appSecret                  string
 	progressStyle              string
 	useInteractiveCard         bool
+	cardAnimation              bool // native typewriter animation on rich cards; default true
 	self                       core.Platform
 	reactionEmoji              string
 	ackEmoji                   string
@@ -429,6 +447,18 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 	if v, ok := opts["enable_feishu_card"].(bool); ok {
 		useInteractiveCard = v
 	}
+	// Native typewriter animation on rich cards. When disabled the platform
+	// skips the cardkit-v1 streaming-text API and renders every card with
+	// config.streaming_mode = false; the body is then refreshed by whole-card
+	// Patches instead of per-character increments.
+	cardAnimation := true
+	if raw, ok := opts["cc_card_animation"]; ok {
+		v, isBool := raw.(bool)
+		if !isBool {
+			return nil, fmt.Errorf("%s: invalid cc_card_animation %v (want bool)", name, raw)
+		}
+		cardAnimation = v
+	}
 
 	imageBatchWindow := defaultImageBatchWindow
 	if raw, ok := opts["image_batch_window_ms"]; ok {
@@ -486,6 +516,7 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 		appSecret:                  appSecret,
 		progressStyle:              progressStyle,
 		useInteractiveCard:         useInteractiveCard,
+		cardAnimation:              cardAnimation,
 		reactionEmoji:              reactionEmoji,
 		ackEmoji:                   ackEmoji,
 		doneEmoji:                  doneEmoji,
@@ -706,7 +737,7 @@ func (p *Platform) startWebSocketMode() error {
 	p.mu.Unlock()
 
 	go func() {
-		if err := p.wsClient.Start(ctx); err != nil {
+		if err := p.wsClient.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			slog.Error(p.tag()+": websocket error", "error", err)
 		}
 	}()
@@ -1171,7 +1202,7 @@ func (p *Platform) IsMessageRecalled(ctx context.Context, rctx any) (bool, error
 
 	req := larkim.NewGetMessageReqBuilder().
 		MessageId(messageID).
-		UserIdType(larkim.UserIdTypeGetMessageOpenId).
+		UserIdType(larkim.UserIdTypeOpenId).
 		Build()
 
 	var resp *larkim.GetMessageResp
@@ -2077,7 +2108,7 @@ func (p *Platform) dispatchMessageWithHistory(ctx context.Context, msgType, cont
 		})
 
 	case "post":
-		textParts, images := p.parsePostContent(messageID, content)
+		textParts, images := p.parsePostContent(messageID, content, mentions...)
 		text := stripMentions(strings.Join(textParts, "\n"), mentions, p.getBotOpenID())
 		// Top-level files[] of a rich-text post message were silently dropped
 		// before #1884 — the user could attach a file alongside text and the
@@ -2234,18 +2265,55 @@ func (p *Platform) dispatchMessageWithHistory(ctx context.Context, msgType, cont
 				slog.Warn(p.tag()+": download media thumbnail failed", "error", err)
 			}
 		}
+		// Also fetch the video itself (file_key, type=file) so the agent can
+		// inspect it, e.g. extract frames with ffmpeg. The cover thumbnail is
+		// kept as an image so models without tool access still see something.
+		// If the download fails the message is still dispatched with the
+		// thumbnail and a note, instead of being dropped.
+		var files []core.FileAttachment
+		if mediaBody.FileKey != "" {
+			if videoData, err := p.downloadResource(messageID, mediaBody.FileKey, "file"); err == nil {
+				name := mediaBody.FileName
+				if name == "" {
+					name = "video.mp4"
+				}
+				files = append(files, core.FileAttachment{MimeType: "video/mp4", Data: videoData, FileName: name})
+			} else {
+				slog.Warn(p.tag()+": download media video failed", "error", err)
+				text += " (video download failed; only the cover image is attached)"
+			}
+		}
 		// Flush any image batch buffered earlier in this session (#1686 P1-B).
 		p.flushImageBatchForSession(sessionKey)
 		dispatchCore(&core.Message{
 			SessionKey: sessionKey, Platform: p.platformName,
 			MessageID: messageID,
 			UserID:    userID, UserName: userName, ChatName: chatName,
-			Content: text, ExtraContent: quoted.text, Images: images, ReplyCtx: rctx,
+			Content: text, ExtraContent: quoted.text, Images: images, Files: files, ReplyCtx: rctx,
 			UserMessageTimeMs: createTimeMs,
 		})
 
-	default:
+	case "system", "interactive":
+		// system messages are generated by Feishu (member joined, …), not
+		// written by the user, so they must not start an agent turn.
+		// Inbound interactive cards are left as they are here.
 		slog.Debug(p.tag()+": ignoring unsupported message type", "type", msgType)
+
+	default:
+		// video_chat, share_chat, share_user, location, calendar shares,
+		// todo, vote, and types added later: the user still expects an
+		// answer, so pass on a one-line description instead of dropping
+		// the message.
+		slog.Debug(p.tag()+": no dedicated handling for message type, forwarding a placeholder", "type", msgType)
+		// Flush any image batch buffered earlier in this session (#1686 P1-B).
+		p.flushImageBatchForSession(sessionKey)
+		dispatchCore(&core.Message{
+			SessionKey: sessionKey, Platform: p.platformName,
+			MessageID: messageID,
+			UserID:    userID, UserName: userName, ChatName: chatName,
+			Content: describeFeishuMessage(msgType, content), ExtraContent: quoted.text, Images: quoted.images, ReplyCtx: rctx,
+			UserMessageTimeMs: createTimeMs,
+		})
 	}
 }
 
@@ -2580,9 +2648,10 @@ func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *ch
 		Code int `json:"code"`
 		Data struct {
 			Items []struct {
-				MsgType  string `json:"msg_type"`
-				ParentID string `json:"parent_id"`
-				Sender   struct {
+				MessageID string `json:"message_id"`
+				MsgType   string `json:"msg_type"`
+				ParentID  string `json:"parent_id"`
+				Sender    struct {
 					ID         string `json:"id"`
 					SenderType string `json:"sender_type"`
 				} `json:"sender"`
@@ -2598,9 +2667,21 @@ func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *ch
 		return nil
 	}
 
+	// Prefer the item matching the requested message ID. Get-message for a
+	// merge_forward root returns the root plus all sub-messages; Items[0] may
+	// be a child, which would make the quote look like a random sub-message.
 	item := resp.Data.Items[0]
+	for _, candidate := range resp.Data.Items {
+		if candidate.MessageID == messageID {
+			item = candidate
+			break
+		}
+	}
+
 	content := item.Body.Content
-	if content == "" {
+	// merge_forward body is a fixed placeholder ("Merged and Forwarded Message");
+	// real content lives in sub-messages and must be fetched separately.
+	if content == "" && item.MsgType != "merge_forward" {
 		return nil
 	}
 
@@ -2675,8 +2756,22 @@ func (p *Platform) fetchSingleMessage(ctx context.Context, messageID string) *ch
 		}
 	case "interactive":
 		text = extractInteractiveCardText(content)
+	case "merge_forward":
+		// Expanding the forward is required when the user replies to a
+		// merge_forward: the reply arrives with a newer create_time and can
+		// set the engine watermark before the async merge_forward dispatch
+		// finishes, causing the standalone forward event to be dropped as
+		// stale. Without this expansion the agent only sees "[merge_forward]".
+		text, images, _ = p.parseMergeForward(messageID)
+		if text == "" {
+			text = "[merge_forward]"
+		}
 	default:
-		text = fmt.Sprintf("[%s]", item.MsgType)
+		if describesFeishuMessageType(item.MsgType) {
+			text = describeFeishuMessage(item.MsgType, content)
+		} else {
+			text = fmt.Sprintf("[%s]", item.MsgType)
+		}
 	}
 	// Empty quoted payloads (no text, no images, no files) are dropped here:
 	// keeping a chainMessage with an empty text would otherwise produce an
@@ -3318,7 +3413,11 @@ func (p *Platform) formatMergeForwardTree(parentID string, childrenMap map[strin
 			p.formatMergeForwardTree(msgID, childrenMap, nameMap, sb, images, files, depth+1)
 
 		default:
-			sb.WriteString(fmt.Sprintf("%s[%s] %s: [%s message]\n", indent, ts, senderName, msgType))
+			if describesFeishuMessageType(msgType) {
+				fmt.Fprintf(sb, "%s[%s] %s: %s\n", indent, ts, senderName, describeFeishuMessage(msgType, content))
+			} else {
+				fmt.Fprintf(sb, "%s[%s] %s: [%s message]\n", indent, ts, senderName, msgType)
+			}
 		}
 	}
 }
@@ -3366,6 +3465,16 @@ func (p *Platform) SendWithStatusFooter(ctx context.Context, rctx any, content, 
 	rc, ok := rctx.(replyContext)
 	if !ok {
 		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
+	}
+	// A pre-built card is already a complete interactive message. Merge the
+	// footer into its elements instead of wrapping the card JSON in another
+	// markdown element, which would make the client render raw JSON.
+	if isCardJSON(content) {
+		merged, mergedOK := appendCardFooterElements(content, footer)
+		if !mergedOK {
+			merged = content
+		}
+		return p.Send(ctx, rctx, merged)
 	}
 	// Resolve mentions first so we can detect whether a real @mention is
 	content = p.resolveMentionsInContent(ctx, rc.chatID, content)
@@ -3490,13 +3599,13 @@ func detectFeishuFileType(mimeType, fileName string) string {
 	name := strings.ToLower(fileName)
 	switch {
 	case mimeType == "application/pdf" || strings.HasSuffix(name, ".pdf"):
-		return larkim.FileTypePdf
+		return larkim.CreateFileFileTypePdf
 	case strings.HasSuffix(name, ".doc") || strings.HasSuffix(name, ".docx"):
-		return larkim.FileTypeDoc
+		return larkim.CreateFileFileTypeDoc
 	case strings.HasSuffix(name, ".xls") || strings.HasSuffix(name, ".xlsx") || strings.HasSuffix(name, ".csv"):
-		return larkim.FileTypeXls
+		return larkim.CreateFileFileTypeXls
 	case strings.HasSuffix(name, ".ppt") || strings.HasSuffix(name, ".pptx"):
-		return larkim.FileTypePpt
+		return larkim.CreateFileFileTypePpt
 	// Feishu's file API only has "mp4" as the video type. We map all common
 	// video MIME types and extensions to FileTypeMp4 so the message renders
 	// as a native video player bubble rather than a generic file download.
@@ -3506,19 +3615,19 @@ func detectFeishuFileType(mimeType, fileName string) string {
 		strings.HasSuffix(name, ".mp4") || strings.HasSuffix(name, ".mov") ||
 		strings.HasSuffix(name, ".avi") || strings.HasSuffix(name, ".m4v") ||
 		strings.HasSuffix(name, ".mkv") || strings.HasSuffix(name, ".webm"):
-		return larkim.FileTypeMp4
+		return larkim.CreateFileFileTypeMp4
 	case mimeType == "audio/ogg" || mimeType == "audio/opus" || mimeType == "application/ogg" || strings.HasSuffix(name, ".ogg") || strings.HasSuffix(name, ".opus"):
-		return larkim.FileTypeOpus
+		return larkim.CreateFileFileTypeOpus
 	default:
-		return larkim.FileTypeStream
+		return larkim.CreateFileFileTypeStream
 	}
 }
 
 func detectFeishuFileMessageType(fileType string) string {
 	switch fileType {
-	case larkim.FileTypeOpus:
+	case larkim.CreateFileFileTypeOpus:
 		return larkim.MsgTypeAudio
-	case larkim.FileTypeMp4:
+	case larkim.CreateFileFileTypeMp4:
 		return larkim.MsgTypeMedia
 	default:
 		return larkim.MsgTypeFile
@@ -3585,6 +3694,17 @@ func detectMimeType(data []byte) string {
 }
 
 func buildReplyContent(content string) (msgType string, body string) {
+	// A pre-built card (Card 2.0 rich card) must be passed through untouched.
+	//
+	// Without this check the card JSON is treated as markdown: buildCardJSON
+	// wraps it in another markdown element, so the card ends up nested inside
+	// itself and the client renders the raw JSON — escaped quotes and literal
+	// \n included — instead of the card. That happens whenever a turn produces
+	// no intermediate text: the rich card is only built at the end and sent
+	// through p.Send, never patched onto an existing preview card.
+	if isCardJSON(content) {
+		return larkim.MsgTypeInteractive, content
+	}
 	// Feishu does not generate mention events for <at> tags in card/post
 	// messages sent by bots. Force MsgTypeText when a real mention is present
 	// (resolved to an <at user_id="..."> or <at id=...> tag) so Feishu
@@ -4188,7 +4308,7 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 
 func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string) error {
 	req := larkim.NewCreateMessageReqBuilder().
-		ReceiveIdType(larkim.ReceiveIdTypeChatId).
+		ReceiveIdType(larkim.CreateMessageV1ReceiveIDTypeChatId).
 		Body(larkim.NewCreateMessageReqBodyBuilder().
 			ReceiveId(chatID).
 			MsgType(msgType).
@@ -4276,11 +4396,15 @@ var (
 	transientRetryMaxDelay = 5 * time.Second
 )
 
-// isTransientError returns true if the error is a transient network error
-// that warrants a retry (connection reset, timeout, EOF, etc.).
+// isTransientError returns true for retryable network failures and internal
+// errors from idempotent card updates.
 func isTransientError(err error) bool {
 	if err == nil {
 		return false
+	}
+	var cardErr *feishuCardAPIError
+	if errors.As(err, &cardErr) && cardErr.Code == 2200 {
+		return true
 	}
 	// Typed syscall checks — more robust than string matching.
 	if errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) {
@@ -4615,6 +4739,33 @@ func isThreadSessionKey(sessionKey string) bool {
 	return ok
 }
 
+// ChannelKeyFromSessionKey implements core.ChannelScopedSessionKey.
+//
+// With thread_isolation enabled, makeSessionKey (feishu.go:4099) encodes an
+// isolated thread — a topic, or a group-chat thread — as
+// "feishu:<chatID>:root:<rootID>", while workspace bindings are keyed
+// "feishu:<chatID>:topic:<rootID>" (populateWorkspaceChannelKeys,
+// feishu.go:1270). Core's generic parse keeps only the chat ID, which would
+// collapse every thread in a chat onto one binding, so the layout is declared
+// here instead of being hardcoded in core.
+//
+// The returned value omits the platform name; core prepends it.
+func (p *Platform) ChannelKeyFromSessionKey(sessionKey string) (string, bool) {
+	if !p.threadIsolation {
+		return "", false
+	}
+	// Four segments: <platform>:<chatID>:root|thread:<rootID>.
+	parts := strings.SplitN(sessionKey, ":", 4)
+	if len(parts) != 4 || parts[0] != p.platformName || parts[1] == "" {
+		return "", false
+	}
+	rootID, ok := parseThreadRootID(parts[2] + ":" + parts[3])
+	if !ok {
+		return "", false
+	}
+	return parts[1] + ":topic:" + rootID, true
+}
+
 // feishuPreviewHandle stores the message ID for an editable preview message.
 // Card 2.0 path needs mu/status/lastContent to let SetPreviewStatus patch
 // the header color without re-rendering the whole card.
@@ -4692,6 +4843,53 @@ func buildCardJSONWithStatusFooter(content, footer string) string {
 	}
 	b, _ := json.Marshal(card)
 	return string(b)
+}
+
+// appendCardFooterElements appends the status footer as a dim ("notation")
+// markdown block to an existing Card 2.0 JSON, separated from the body by a
+// horizontal rule. Returns the updated card and true on success; on failure
+// the original card is returned unchanged so the caller can fall back.
+//
+// A pre-built card already carries its own header and body, so the footer
+// cannot be appended the way buildCardJSONWithStatusFooter does it — it has
+// to be merged into the existing elements list.
+func appendCardFooterElements(cardJSON, footer string) (string, bool) {
+	if strings.TrimSpace(footer) == "" {
+		return cardJSON, false
+	}
+	var card map[string]any
+	if err := json.Unmarshal([]byte(cardJSON), &card); err != nil {
+		return cardJSON, false
+	}
+	body, ok := card["body"].(map[string]any)
+	if !ok {
+		return cardJSON, false
+	}
+	elements, ok := body["elements"].([]any)
+	if !ok {
+		return cardJSON, false
+	}
+	footerElements := []any{map[string]any{"tag": "hr"}}
+	for _, line := range strings.Split(sanitizeCardMarkdownForCard(footer), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		footerElements = append(footerElements, map[string]any{
+			"tag":       "markdown",
+			"content":   line,
+			"text_size": "notation",
+		})
+	}
+	if len(footerElements) == 1 {
+		return cardJSON, false
+	}
+	body["elements"] = append(elements, footerElements...)
+	out, err := json.Marshal(card)
+	if err != nil {
+		return cardJSON, false
+	}
+	return string(out), true
 }
 
 func isZhLikeProgressLang(lang string) bool {
@@ -5041,10 +5239,13 @@ func progressPanelTitle(label string, count int, lang string) string {
 	return label
 }
 
-func buildProgressPanel(title string, expanded bool, elements []map[string]any) map[string]any {
+// Panels always start collapsed. Every card update re-sends the whole card, so
+// an expanded flag would re-open the panels on each refresh and make the text
+// below them jump while the turn is running.
+func buildProgressPanel(title string, elements []map[string]any) map[string]any {
 	return map[string]any{
 		"tag":              "collapsible_panel",
-		"expanded":         expanded,
+		"expanded":         false,
 		"background_color": "grey",
 		"header": map[string]any{
 			"title": map[string]any{"tag": "plain_text", "content": title},
@@ -5064,26 +5265,23 @@ func buildProgressPanelElements(items []core.ProgressCardEntry, lang string) []m
 	return elements
 }
 
-func appendProgressGroupedElements(elements []map[string]any, items []core.ProgressCardEntry, lang string, running bool) []map[string]any {
+func appendProgressGroupedElements(elements []map[string]any, items []core.ProgressCardEntry, lang string) []map[string]any {
 	reasoning, tools, others := splitProgressItemsByLane(items)
 	if len(reasoning) > 0 {
 		elements = append(elements, buildProgressPanel(
 			progressPanelTitle("Reasoning", len(reasoning), lang),
-			running,
 			buildProgressPanelElements(reasoning, lang),
 		))
 	}
 	if len(tools) > 0 {
 		elements = append(elements, buildProgressPanel(
 			progressPanelTitle("Tools", len(tools), lang),
-			running,
 			buildProgressPanelElements(tools, lang),
 		))
 	}
 	if len(others) > 0 {
 		elements = append(elements, buildProgressPanel(
 			progressPanelTitle("Updates", len(others), lang),
-			running,
 			buildProgressPanelElements(others, lang),
 		))
 	}
@@ -5098,7 +5296,6 @@ func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string 
 
 	agent := progressAgentLabel(payload.Agent)
 	title, template, footer := progressStateMeta(payload.State, payload.Lang, agent)
-	running := payload.State == core.ProgressCardStateRunning
 
 	elements := make([]map[string]any, 0, len(items)+3)
 	if payload.Truncated {
@@ -5118,7 +5315,7 @@ func buildProgressCardJSONFromPayload(payload *core.ProgressCardPayload) string 
 		elements = append(elements, map[string]any{"tag": "hr"})
 	}
 
-	elements = appendProgressGroupedElements(elements, items, payload.Lang, running)
+	elements = appendProgressGroupedElements(elements, items, payload.Lang)
 	if footer != "" {
 		elements = append(elements, map[string]any{"tag": "hr"})
 		elements = append(elements, map[string]any{
@@ -5201,7 +5398,16 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 		// Im.Message.Reply and Im.Message.Create accept the {type:card,data:{card_id}}
 		// content schema (verified by direct API call); skipping Reply mode would
 		// disable cardkit-v1 streaming on every @-mention turn (the dominant case).
-		if id, err := p.createCardEntity(ctx, cardJSON); err == nil {
+		//
+		// With cardAnimation off we deliberately skip the cardkit entity: a
+		// card_id-backed card is always in streaming mode, and Feishu renders
+		// streaming text with a typewriter animation. Sending the card inline
+		// instead keeps the rich card layout, and the engine refreshes it with
+		// whole-card Patches (no per-character typewriter).
+		if !p.cardAnimation {
+			cardJSON = disableCardStreamingMode(cardJSON)
+			sendContent = cardJSON
+		} else if id, err := p.createCardEntity(ctx, cardJSON); err == nil {
 			cardID = id
 			sendContent = fmt.Sprintf(`{"type":"card","data":{"card_id":"%s"}}`, id)
 		} else {
@@ -5241,7 +5447,7 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 		}
 	} else {
 		req := larkim.NewCreateMessageReqBuilder().
-			ReceiveIdType(larkim.ReceiveIdTypeChatId).
+			ReceiveIdType(larkim.CreateMessageV1ReceiveIDTypeChatId).
 			Body(larkim.NewCreateMessageReqBodyBuilder().
 				ReceiveId(chatID).
 				MsgType(larkim.MsgTypeInteractive).
@@ -5431,6 +5637,17 @@ func (p *Platform) UpdateMessageWithStatusFooter(ctx context.Context, previewHan
 	if strings.TrimSpace(footer) == "" {
 		return p.UpdateMessage(ctx, previewHandle, content)
 	}
+	// A pre-built card must not be re-wrapped: buildCardJSONWithStatusFooter
+	// would nest the card JSON inside itself and the client would render the
+	// raw JSON instead of the card. Merge the footer into the card instead.
+	if isCardJSON(content) {
+		merged, mergedOK := appendCardFooterElements(content, footer)
+		if !mergedOK {
+			return p.UpdateMessage(ctx, previewHandle, content)
+		}
+		content = merged
+		footer = ""
+	}
 	h, ok := previewHandle.(*feishuPreviewHandle)
 	if !ok {
 		return fmt.Errorf("%s: invalid preview handle type %T", p.tag(), previewHandle)
@@ -5458,18 +5675,22 @@ func (p *Platform) patchCardMessage(ctx context.Context, messageID, cardJSON str
 			Content(cardJSON).
 			Build()).
 		Build()
-	return p.withTransientRetry(ctx, "patch message", func() error {
+	err := p.withTransientRetry(ctx, "patch message", func() error {
 		return p.withFreshTenantAccessTokenRetry(ctx, "patch message", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			resp, err := client.Im.Message.Patch(ctx, req, options...)
 			if err != nil {
 				return fmt.Errorf("%s: patch message: %w", p.tag(), err)
 			}
 			if !resp.Success() {
-				return fmt.Errorf("%s: patch message code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
+				return fmt.Errorf("%s: %w", p.tag(), classifyFeishuCardAPIError("patch message", resp.Code, resp.Msg))
 			}
 			return nil
 		})
 	})
+	if err != nil && errors.Is(err, errFeishuCardRateLimited) {
+		slog.Warn(p.tag()+": patch message rate limited", "message_id", messageID)
+	}
+	return err
 }
 
 // updateCardEntity performs a full-card replacement on a cardkit-v1 entity via
@@ -5605,7 +5826,7 @@ func (p *Platform) SendAudio(ctx context.Context, rctx any, audio []byte, format
 		return p.withFreshTenantAccessTokenRetry(ctx, "upload audio", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			req := larkim.NewCreateFileReqBuilder().
 				Body(larkim.NewCreateFileReqBodyBuilder().
-					FileType(larkim.FileTypeOpus).
+					FileType(larkim.CreateFileFileTypeOpus).
 					FileName("tts_audio.opus").
 					File(bytes.NewReader(audio)).
 					Build()).
@@ -5680,7 +5901,7 @@ func (p *Platform) SendVideo(ctx context.Context, rctx any, video []byte, format
 		return p.withFreshTenantAccessTokenRetry(ctx, "upload video", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			req := larkim.NewCreateFileReqBuilder().
 				Body(larkim.NewCreateFileReqBodyBuilder().
-					FileType(larkim.FileTypeMp4).
+					FileType(larkim.CreateFileFileTypeMp4).
 					FileName(fileName).
 					File(bytes.NewReader(video)).
 					Build()).
@@ -5739,17 +5960,17 @@ type postLang struct {
 // parsePostContent handles both formats of feishu post content:
 // 1. {"title":"...", "content":[[...]]}  (receive event)
 // 2. {"zh_cn":{"title":"...", "content":[[...]]}}  (some SDK versions)
-func (p *Platform) parsePostContent(messageID, raw string) ([]string, []core.ImageAttachment) {
+func (p *Platform) parsePostContent(messageID, raw string, mentions ...*larkim.MentionEvent) ([]string, []core.ImageAttachment) {
 	// try flat format first
 	var flat postLang
 	if err := json.Unmarshal([]byte(raw), &flat); err == nil && flat.Content != nil {
-		return p.extractPostParts(messageID, &flat)
+		return p.extractPostParts(messageID, &flat, mentions...)
 	}
 	// try language-keyed format
 	var langMap map[string]postLang
 	if err := json.Unmarshal([]byte(raw), &langMap); err == nil {
 		for _, lang := range langMap {
-			return p.extractPostParts(messageID, &lang)
+			return p.extractPostParts(messageID, &lang, mentions...)
 		}
 	}
 	slog.Error(p.tag()+": failed to parse post content", "raw", raw)
@@ -5774,7 +5995,7 @@ func (p *Platform) parsePostFiles(raw string) []postFile {
 	return nil
 }
 
-func (p *Platform) extractPostParts(messageID string, post *postLang) ([]string, []core.ImageAttachment) {
+func (p *Platform) extractPostParts(messageID string, post *postLang, mentions ...*larkim.MentionEvent) ([]string, []core.ImageAttachment) {
 	var textParts []string
 	var images []core.ImageAttachment
 	if post.Title != "" {
@@ -5803,7 +6024,7 @@ func (p *Platform) extractPostParts(messageID string, post *postLang) ([]string,
 					textParts = append(textParts, elem.Text)
 				}
 			case "at":
-				if p.getBotOpenID() != "" && elem.UserId == p.getBotOpenID() {
+				if isPostBotMention(elem.UserId, p.getBotOpenID(), mentions) {
 					continue
 				}
 				switch {
@@ -5827,6 +6048,24 @@ func (p *Platform) extractPostParts(messageID string, post *postLang) ([]string,
 		}
 	}
 	return textParts, images
+}
+
+// Rich-text events can use a mention placeholder rather than an OpenID in an
+// at element. Resolve its identity before rendering it as a display name.
+func isPostBotMention(userID, botOpenID string, mentions []*larkim.MentionEvent) bool {
+	if botOpenID == "" {
+		return false
+	}
+	if userID == botOpenID {
+		return true
+	}
+	for _, mention := range mentions {
+		if mention != nil && mention.Key != nil && *mention.Key == userID &&
+			mention.Id != nil && mention.Id.OpenId != nil && *mention.Id.OpenId == botOpenID {
+			return true
+		}
+	}
+	return false
 }
 
 // onBotMenu handles bot custom menu click events. When a menu item's
@@ -7077,19 +7316,44 @@ func isCardJSON(content string) bool {
 	return strings.Contains(content, `"schema"`) && strings.Contains(content, `"body"`)
 }
 
+// disableCardStreamingMode turns off the card's streaming_mode flag so Feishu
+// renders the text without the typewriter animation. Best-effort: on any
+// unmarshal error the original card JSON is returned unchanged.
+func disableCardStreamingMode(cardJSON string) string {
+	var card map[string]any
+	if err := json.Unmarshal([]byte(cardJSON), &card); err != nil {
+		return cardJSON
+	}
+	cfg, ok := card["config"].(map[string]any)
+	if !ok {
+		return cardJSON
+	}
+	cfg["streaming_mode"] = false
+	out, err := json.Marshal(card)
+	if err != nil {
+		return cardJSON
+	}
+	return string(out)
+}
+
 // buildCardJSONWithStatus builds a Feishu card JSON with a colored header
 // reflecting the given status. Used as a fallback when rich-card assembly fails.
-func buildCardJSONWithStatus(content string, status core.CardStatus) string {
-	content = sanitizeCardMarkdownForCard(content)
-	template := "grey"
+// statusTemplateColor maps a card status to its header template color.
+func statusTemplateColor(status core.CardStatus) string {
 	switch status {
 	case core.CardStatusWorking, core.CardStatusThinking:
-		template = "blue"
+		return "blue"
 	case core.CardStatusDone:
-		template = "green"
+		return "green"
 	case core.CardStatusError:
-		template = "red"
+		return "red"
 	}
+	return "grey"
+}
+
+func buildCardJSONWithStatus(content string, status core.CardStatus) string {
+	content = sanitizeCardMarkdownForCard(content)
+	template := statusTemplateColor(status)
 	card := map[string]any{
 		"schema": "2.0",
 		"config": map[string]any{
@@ -7194,10 +7458,11 @@ func richPanelElements(steps []core.ToolStep, emptyText string) []map[string]any
 	return elements
 }
 
-func buildRichPanel(title string, expanded bool, elements []map[string]any) map[string]any {
+// buildRichPanel panels start collapsed for the same reason as buildProgressPanel.
+func buildRichPanel(title string, elements []map[string]any) map[string]any {
 	return map[string]any{
 		"tag":              "collapsible_panel",
-		"expanded":         expanded,
+		"expanded":         false,
 		"background_color": "grey",
 		"header": map[string]any{
 			"title": map[string]any{"tag": "plain_text", "content": title},
@@ -7263,19 +7528,17 @@ func buildRichCardJSONBytes(status core.CardStatus, steps []core.ToolStep, markd
 	if len(reasoningSteps) > 0 {
 		panelMaps = append(panelMaps, buildRichPanel(
 			richLaneTitle("Reasoning", len(reasoningSteps)),
-			streaming,
 			richPanelElements(reasoningSteps, "Thinking..."),
 		))
 	}
 	if len(toolSteps) > 0 {
 		panelMaps = append(panelMaps, buildRichPanel(
 			richLaneTitle("Tools", len(toolSteps)),
-			streaming,
 			richPanelElements(toolSteps, "No tool steps"),
 		))
 	}
 	if len(panelMaps) == 0 && streaming {
-		panelMaps = append(panelMaps, buildRichPanel("Reasoning", true, richPanelElements(nil, "Thinking...")))
+		panelMaps = append(panelMaps, buildRichPanel("Reasoning", richPanelElements(nil, "Thinking...")))
 	}
 
 	markdownMap := map[string]any{
@@ -7440,12 +7703,49 @@ func splitMarkdownByTables(md string, maxTables int) []string {
 // statusFooter (multi-line, '\n'-separated) and passes it through; the renderer
 // splits it back into one dim notation block per line.
 func (p *Platform) BuildRichCard(status core.CardStatus, title string, steps []core.ToolStep, markdown string, streaming bool, statusFooter string) string {
-	return buildRichCard(status, title, steps, markdown, streaming, statusFooter)
+	card := buildRichCard(status, title, steps, markdown, streaming, statusFooter)
+	if !p.cardAnimation {
+		// The switch has to hold for the card's whole lifetime, not just its
+		// creation: the engine rebuilds every mid-turn frame with
+		// streaming=true, so an update would otherwise re-arm the typewriter.
+		card = disableCardStreamingMode(card)
+	}
+	return card
 }
 
 // SplitMarkdownByTables implements core.MarkdownTableSplitter.
 func (p *Platform) SplitMarkdownByTables(md string, maxTables int) []string {
 	return splitMarkdownByTables(md, maxTables)
+}
+
+// previewStatusCardJSON returns the card JSON used to patch the preview
+// message for a status change.
+//
+// lastContent is whatever was last handed to UpdateMessage. On the rich card
+// path that is itself a complete card JSON, so it must not be wrapped in
+// another markdown element — wrapping nests the card inside itself and the
+// client renders the raw JSON (escaped quotes, literal \n) instead of the
+// card. For a pre-built card only the header template is changed; the body is
+// left exactly as it was.
+func previewStatusCardJSON(lastContent string, status core.CardStatus) string {
+	if !isCardJSON(lastContent) {
+		return buildCardJSONWithStatus(lastContent, status)
+	}
+	var card map[string]any
+	if err := json.Unmarshal([]byte(lastContent), &card); err != nil {
+		return lastContent
+	}
+	header, ok := card["header"].(map[string]any)
+	if !ok {
+		header = map[string]any{}
+	}
+	header["template"] = statusTemplateColor(status)
+	card["header"] = header
+	out, err := json.Marshal(card)
+	if err != nil {
+		return lastContent
+	}
+	return string(out)
 }
 
 // SetPreviewStatus updates the card header color to reflect the agent's current state.
@@ -7463,7 +7763,7 @@ func (p *Platform) SetPreviewStatus(previewHandle any, status core.CardStatus) {
 	if lastContent == "" {
 		return
 	}
-	cardJSON := buildCardJSONWithStatus(lastContent, status)
+	cardJSON := previewStatusCardJSON(lastContent, status)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
